@@ -72,6 +72,12 @@ label { display: block; margin: 8px 0; }
 .chunk .t { color: #7ab7ff; margin-right: 5px; }
 .chunk .i { color: #9aa3af; }
 .speech { color: #d6c37a; font-style: italic; margin-top: 2px; }
+.clip-status { margin-top: 4px; }
+.badge { font-size: 11px; border-radius: 9px; padding: 1px 8px; }
+.badge.done { background: #1e3a24; color: #7dd87d; }
+.badge.running { background: #3a331e; color: #e8b350; animation: pulse 1.2s infinite; }
+.badge.waiting { background: #262b33; color: #9aa3af; }
+@keyframes pulse { 50% { opacity: 0.5; } }
 
 #brief { width: 100%; max-width: 640px; }
 .chip { background: #2b3038; border-radius: 10px; padding: 2px 9px; font-size: 12px; }

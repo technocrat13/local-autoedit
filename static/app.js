@@ -90,9 +90,10 @@ async function renderClips() {
       `<label class="clip-head"><input type="checkbox" data-source="${esc(clip.source)}"> ` +
       `<img loading="lazy" src="/api/thumb?path=${encodeURIComponent(state.project.project)}&clip=${encodeURIComponent(clip.source)}" alt="">` +
       `<span>${esc(clip.source)}</span></label>` +
+      `<div class="clip-status" data-clip="${esc(clip.source)}"></div>` +
       (clip.chunks.length
         ? `<details><summary>${clip.chunks.length} chunks</summary><div class="chunks">${chunkRows}</div></details>`
-        : `<div class="hint">not analyzed</div>`);
+        : `<div class="hint clip-status-hint" data-clip-hint="${esc(clip.source)}">not analyzed</div>`);
     card.querySelector("input").onchange = (e) => {
       if (e.target.checked) state.selectedSources.add(clip.source);
       else state.selectedSources.delete(clip.source);
@@ -250,6 +251,7 @@ function watchJob(jobId, type) {
         state.activeJob.logOffset = j.log_offset;
       }
       $("#job-title").textContent = `${j.type} job #${jobId} - ${j.stage}`;
+      if (j.type === "analyze" && j.progress) updateClipStatuses(j.progress);
       if (j.status === "done" || j.status === "error") {
         clearInterval(state.pollTimer);
         setJobButtons(false);
@@ -272,6 +274,22 @@ function setJobButtons(busy) {
     .forEach((b) => {
       if (["preview", "finalize"].includes(b.dataset.act) || !b.dataset.act) b.disabled = busy;
     });
+}
+
+function updateClipStatuses(progress) {
+  document.querySelectorAll(".clip-status").forEach((el) => {
+    const clip = el.dataset.clip;
+    const hint = document.querySelector(`[data-clip-hint="${CSS.escape(clip)}"]`);
+    if (progress.done.includes(clip)) {
+      el.innerHTML = `<span class="badge done">analyzed &#10003;</span>`;
+      if (hint) hint.remove();
+    } else if (progress.current === clip) {
+      el.innerHTML = `<span class="badge running">analyzing&hellip;</span>`;
+      if (hint) hint.textContent = "analyzing now";
+    } else {
+      el.innerHTML = `<span class="badge waiting">waiting</span>`;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

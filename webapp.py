@@ -144,7 +144,8 @@ def submit_job(job_type, project, params):
         job_id = _job_counter
         JOBS[job_id] = {"id": job_id, "type": job_type, "project": project,
                         "params": params, "status": "queued", "stage": "queued",
-                        "log": _JobLog(), "result": None, "error": None}
+                        "log": _JobLog(), "result": None, "error": None,
+                        "progress": None}
     JOB_QUEUE.put(job_id)
     return job_id
 
@@ -182,14 +183,23 @@ def job_analyze(job):
     if not pairs:
         raise RuntimeError("No LRF/MP4 pairs found in this folder.")
     engine.load_model()
-    set_stage(job, f"analyzing {len(pairs)} clips")
     library = engine.ChunkLibrary()
     preprocessor = engine.VideoPreprocessor(WORKDIR)
     analyzer = engine.ChunkAnalyzer()
     transcriber = engine.SpeechTranscriber()
-    for pair in pairs:
+    done = []
+    for i, pair in enumerate(pairs):
+        source = os.path.basename(pair["hires"])
+        with JOBS_LOCK:
+            job["progress"] = {"done": list(done), "current": source,
+                               "total": len(pairs), "chunks": len(library.chunks)}
+        set_stage(job, f"analyzing {source} ({i + 1}/{len(pairs)})")
         engine.analyze_clip(pair, preprocessor, analyzer, transcriber,
                             library, WORKDIR, None)
+        done.append(source)
+    with JOBS_LOCK:
+        job["progress"] = {"done": done, "current": None,
+                           "total": len(pairs), "chunks": len(library.chunks)}
     transcriber.unload()
     if not library.chunks:
         raise RuntimeError("No analyzable chunks found in the footage.")
@@ -418,8 +428,8 @@ def api_jobs_get(job_id):
         text = job["log"].getvalue()
         return jsonify({"id": job_id, "type": job["type"], "status": job["status"],
                         "stage": job["stage"], "result": job["result"],
-                        "error": job["error"], "log_delta": text[offset:],
-                        "log_offset": len(text)})
+                        "error": job["error"], "progress": job["progress"],
+                        "log_delta": text[offset:], "log_offset": len(text)})
 
 
 @app.get("/api/jobs")
