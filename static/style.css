@@ -1,0 +1,112 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  color: #ddd;
+  background: #16181d;
+}
+.hidden { display: none !important; }
+button {
+  background: #2b3038;
+  color: #ddd;
+  border: 1px solid #3c4350;
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #39414d; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.linkish {
+  background: none;
+  border: none;
+  color: #7ab7ff;
+  padding: 2px 0;
+}
+input, textarea {
+  background: #0f1114;
+  color: #ddd;
+  border: 1px solid #3c4350;
+  border-radius: 4px;
+  padding: 5px 7px;
+  font: inherit;
+}
+label { display: block; margin: 8px 0; }
+
+#layout { display: flex; height: 100vh; }
+#sidebar {
+  width: 280px;
+  min-width: 280px;
+  border-right: 1px solid #2b3038;
+  padding: 12px;
+  overflow-y: auto;
+}
+#sidebar h1 { font-size: 16px; margin: 0 0 10px; }
+#crumbs { font-size: 12px; color: #9aa3af; margin-bottom: 8px; word-break: break-all; }
+#folders { list-style: none; margin: 0; padding: 0; }
+#folders li { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; }
+#folders .open { font-size: 12px; padding: 2px 8px; }
+
+#main { flex: 1; padding: 16px 20px; overflow-y: auto; }
+#no-project { color: #9aa3af; margin-top: 40px; text-align: center; }
+#project-header { display: flex; align-items: baseline; gap: 14px; }
+#project-header h2 { margin: 0 0 8px; }
+.ok { color: #7dd87d; }
+.warn { color: #e8b350; }
+.hint { color: #9aa3af; font-size: 12px; }
+
+#tabs { border-bottom: 1px solid #2b3038; margin-bottom: 14px; }
+#tabs button { border: none; background: none; padding: 8px 14px; border-radius: 0; }
+#tabs button.active { border-bottom: 2px solid #7ab7ff; color: #fff; }
+.tab { display: none; }
+.tab.active { display: block; }
+.row { display: flex; gap: 18px; align-items: center; }
+
+#clips-actions { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; }
+#clip-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.clip-card { background: #1c2027; border: 1px solid #2b3038; border-radius: 6px; padding: 10px; }
+.clip-head { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0; }
+.clip-head img { width: 96px; border-radius: 4px; background: #000; }
+.chunks { max-height: 240px; overflow-y: auto; margin-top: 6px; }
+.chunk { padding: 4px 0; border-top: 1px solid #262b33; font-size: 12px; }
+.chunk .t { color: #7ab7ff; margin-right: 5px; }
+.chunk .i { color: #9aa3af; }
+.speech { color: #d6c37a; font-style: italic; margin-top: 2px; }
+
+#brief { width: 100%; max-width: 640px; }
+.chip { background: #2b3038; border-radius: 10px; padding: 2px 9px; font-size: 12px; }
+#selected-chips { margin: 10px 0; }
+#btn-compose { margin-top: 6px; padding: 8px 18px; }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262b33; vertical-align: top; }
+th { color: #9aa3af; font-weight: 500; font-size: 12px; }
+td button { margin-right: 5px; font-size: 12px; }
+.brief-cell, .summary-cell { max-width: 340px; font-size: 12px; }
+.num { width: 78px; }
+.drag { cursor: grab; color: #9aa3af; }
+.disabled-cut { opacity: 0.4; }
+
+#job-drawer {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  background: #0f1114;
+  border-top: 1px solid #3c4350;
+  max-height: 40vh;
+  display: flex;
+  flex-direction: column;
+}
+#job-head { display: flex; justify-content: space-between; padding: 6px 14px; background: #1c2027; }
+#job-log { flex: 1; overflow-y: auto; margin: 0; padding: 8px 14px; font-size: 12px; white-space: pre-wrap; }
+
+#video-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#video-box { position: relative; width: min(80vw, 960px); }
+#video-box video { width: 100%; border-radius: 6px; background: #000; }
+#video-close { position: absolute; top: -34px; right: 0; }

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Auto-Editor</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1>Auto-Editor</h1>
+    <div id="crumbs"></div>
+    <ul id="folders"></ul>
+  </aside>
+
+  <main id="main">
+    <div id="no-project">Open a folder with DJI LRF/MP4 pairs to start.</div>
+
+    <div id="project" class="hidden">
+      <header id="project-header">
+        <h2 id="project-name"></h2>
+        <span id="library-status"></span>
+      </header>
+
+      <nav id="tabs">
+        <button data-tab="clips" class="active">Clips</button>
+        <button data-tab="compose">Compose</button>
+        <button data-tab="versions">Versions</button>
+        <button data-tab="edl" id="edl-tab" disabled>EDL editor</button>
+      </nav>
+
+      <section id="tab-clips" class="tab active">
+        <div id="clips-actions">
+          <button id="btn-analyze">Analyze footage</button>
+          <span class="hint">Tick clips to include them in the next compose job (none = all).</span>
+        </div>
+        <div id="clip-grid"></div>
+      </section>
+
+      <section id="tab-compose" class="tab">
+        <label>Brief for this job
+          <textarea id="brief" rows="4" placeholder="Leave empty for the default day-in-the-life brief"></textarea>
+        </label>
+        <div class="row">
+          <label>Target cuts <input id="target-cuts" type="number" value="15" min="3" max="60"></label>
+          <label>Margin (s) <input id="margin" type="number" value="3" min="2" max="5" step="0.5"></label>
+        </div>
+        <div id="selected-chips"></div>
+        <button id="btn-compose">Compose + preview</button>
+      </section>
+
+      <section id="tab-versions" class="tab">
+        <table id="versions-table">
+          <thead><tr><th>v</th><th>created</th><th>origin</th><th>brief</th><th>cuts</th><th>files</th><th>actions</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="tab-edl" class="tab">
+        <div class="row">
+          <h3 id="edl-title"></h3>
+          <button id="btn-edl-save">Save as new version</button>
+        </div>
+        <table id="edl-table">
+          <thead><tr><th></th><th>on</th><th>source</th><th>start</th><th>end</th><th>role / beat</th><th>summary</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div id="job-drawer" class="hidden">
+  <div id="job-head"><span id="job-title"></span><button id="job-close">×</button></div>
+  <pre id="job-log"></pre>
+</div>
+
+<div id="video-modal" class="hidden">
+  <div id="video-box">
+    <button id="video-close">×</button>
+    <video id="player" controls></video>
+  </div>
+</div>
+
+<script>window.ROOT = {{ root | tojson }};</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

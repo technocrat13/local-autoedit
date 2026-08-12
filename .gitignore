@@ -1,0 +1,18 @@
+# local env / caches
+.venv-test/
+__pycache__/
+*.pyc
+.claude/
+
+# footage and generated media (never commit source video or renders)
+*.mp4
+*.MP4
+*.lrf
+*.LRF
+*.m4a
+*.wav
+
+# per-project derived data
+autoedit/
+*_library.json
+*_edl.json
