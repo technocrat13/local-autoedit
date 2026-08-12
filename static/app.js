@@ -313,4 +313,19 @@ $("#video-close").onclick = () => {
   $("#video-modal").classList.add("hidden");
 };
 
+// On page load, re-attach to any job still queued/running on the server
+// (jobs survive refreshes - only the browser's handle is lost).
+async function reconnectJobs() {
+  try {
+    const data = await api("/api/jobs");
+    const active = data.jobs.find((j) => j.status === "running" || j.status === "queued");
+    if (!active) return;
+    if (!state.project) await openProject(active.project);
+    watchJob(active.id, active.type);
+  } catch (e) {
+    /* no jobs yet or server restarted - nothing to re-attach */
+  }
+}
+
 browse(window.ROOT).catch((e) => alert("Browse failed: " + e.message));
+reconnectJobs();
