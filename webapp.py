@@ -183,28 +183,32 @@ def job_analyze(job):
     if not pairs:
         raise RuntimeError("No LRF/MP4 pairs found in this folder.")
     engine.load_model()
-    library = engine.ChunkLibrary()
+    os.makedirs(paths["autoedit"], exist_ok=True)
+    library, done_set = engine.ChunkLibrary.load_resumable(paths["library"], pairs)
     preprocessor = engine.VideoPreprocessor(WORKDIR)
     analyzer = engine.ChunkAnalyzer()
     transcriber = engine.SpeechTranscriber()
-    done = []
+    done = sorted(done_set)
     for i, pair in enumerate(pairs):
         source = os.path.basename(pair["hires"])
+        if source in done_set:
+            continue
         with JOBS_LOCK:
             job["progress"] = {"done": list(done), "current": source,
                                "total": len(pairs), "chunks": len(library.chunks)}
         set_stage(job, f"analyzing {source} ({i + 1}/{len(pairs)})")
         engine.analyze_clip(pair, preprocessor, analyzer, transcriber,
                             library, WORKDIR, None)
-        done.append(source)
+        done_set.add(source)
+        done = sorted(done_set)
+        # Incremental checkpoint: a stopped job resumes from the next clip.
+        library.save(paths["library"], pairs, analyzed_sources=done_set)
     with JOBS_LOCK:
         job["progress"] = {"done": done, "current": None,
                            "total": len(pairs), "chunks": len(library.chunks)}
     transcriber.unload()
     if not library.chunks:
         raise RuntimeError("No analyzable chunks found in the footage.")
-    os.makedirs(paths["autoedit"], exist_ok=True)
-    library.save(paths["library"], pairs)
     return {"chunks": len(library.chunks)}
 
 
@@ -335,14 +339,19 @@ def api_project_open():
     project = safe_path((request.json or {}).get("path"))
     pairs = engine.get_video_pairs(project)
     paths = project_paths(project)
-    library = engine.ChunkLibrary.load_if_valid(paths["library"], pairs) if pairs else None
-    library_stale = library is None and os.path.exists(paths["library"])
+    library, done = (engine.ChunkLibrary.load_resumable(paths["library"], pairs)
+                     if pairs else (None, set()))
+    total = len(pairs)
+    complete = bool(pairs) and len(done) == total
+    library_stale = not done and os.path.exists(paths["library"])
     return jsonify({
         "project": project,
         "name": os.path.basename(project),
         "pairs": [{"source": os.path.basename(p["hires"]),
                    "lrf": p["lrf"], "hires": p["hires"]} for p in pairs],
-        "library": {"exists": library is not None,
+        "library": {"exists": complete,
+                    "partial": bool(done) and not complete,
+                    "analyzed_clips": len(done), "total_clips": total,
                     "stale": library_stale,
                     "chunks": len(library.chunks) if library else 0},
         "versions": versions_with_files(project),
@@ -354,7 +363,8 @@ def api_project_clips():
     project = safe_path(request.args.get("path"))
     pairs = engine.get_video_pairs(project)
     paths = project_paths(project)
-    library = engine.ChunkLibrary.load_if_valid(paths["library"], pairs) if pairs else None
+    library, done = (engine.ChunkLibrary.load_resumable(paths["library"], pairs)
+                     if pairs else (None, set()))
     by_source = {}
     if library:
         for c in library.chunks:
@@ -369,8 +379,10 @@ def api_project_clips():
         chunks = by_source.get(source, [])
         clips.append({"source": source,
                       "duration": chunks[-1]["end"] if chunks else None,
+                      "analyzed": source in done,
                       "chunks": chunks})
-    return jsonify({"clips": clips, "analyzed": library is not None})
+    return jsonify({"clips": clips, "analyzed_clips": len(done),
+                    "total_clips": len(pairs)})
 
 
 @app.get("/api/thumb")

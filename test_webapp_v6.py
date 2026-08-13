@@ -233,5 +233,72 @@ check("both jobs complete after gate",
       client.get(f"/api/jobs/{a}").get_json()["status"] == "done"
       and client.get(f"/api/jobs/{b}").get_json()["status"] == "done")
 
+# ---- 9. incremental library: partial save + resume -------------------------------
+projectB = os.path.join(root, "dayB")
+os.makedirs(projectB)
+for stem in ("DJI_0101", "DJI_0102", "DJI_0103"):
+    for ext in (".LRF", ".MP4"):
+        with open(os.path.join(projectB, stem + ext), "wb") as f:
+            f.write(b"\x00" * 128)
+pairsB = ae.get_video_pairs(projectB)
+pathsB = webapp.project_paths(projectB)
+os.makedirs(pathsB["autoedit"], exist_ok=True)
+libB = ae.ChunkLibrary()
+libB.add({"source": "DJI_0101.MP4",
+          "hires_path": os.path.join(projectB, "DJI_0101.MP4"),
+          "start": 0.0, "end": 5.0, "scene": "street", "visual_tags": [],
+          "actions": [], "people_count": 0, "emotions": [],
+          "transition_flag": False, "one_line_summary": "walk",
+          "interest_score": 0.4, "clip_duration": 20.0,
+          "audio": {"loudness_peak_db": -12.0},
+          "speech": {"transcript": "", "has_speech": False, "language": "en"}})
+libB.save(pathsB["library"], pairsB, analyzed_sources={"DJI_0101.MP4"})
+
+check("partial library rejected by load_if_valid",
+      ae.ChunkLibrary.load_if_valid(pathsB["library"], pairsB) is None)
+rlib, rdone = ae.ChunkLibrary.load_resumable(pathsB["library"], pairsB)
+check("load_resumable returns chunks + done set",
+      len(rlib.chunks) == 1 and rdone == {"DJI_0101.MP4"})
+
+data = client.post("/api/project/open", json={"path": projectB}).get_json()
+check("project open reports partial library",
+      not data["library"]["exists"] and data["library"]["partial"]
+      and data["library"]["analyzed_clips"] == 1
+      and data["library"]["total_clips"] == 3)
+clipsB = client.get(f"/api/project/clips?path={projectB}").get_json()
+byname = {c["source"]: c for c in clipsB["clips"]}
+check("per-clip analyzed flags",
+      byname["DJI_0101.MP4"]["analyzed"]
+      and not byname["DJI_0102.MP4"]["analyzed"]
+      and clipsB["analyzed_clips"] == 1 and clipsB["total_clips"] == 3)
+
+# resume: analyze skips done clip, saves after each remaining clip
+ANALYZED = []
+def fake_analyze(pair, preprocessor, analyzer, transcriber, library, *a, **k):
+    src = os.path.basename(pair["hires"])
+    ANALYZED.append(src)
+    library.add({"source": src, "hires_path": pair["hires"],
+                 "start": 0.0, "end": 5.0, "scene": "s", "visual_tags": [],
+                 "actions": [], "people_count": 0, "emotions": [],
+                 "transition_flag": False, "one_line_summary": "m",
+                 "interest_score": 0.5, "clip_duration": 20.0,
+                 "audio": {"loudness_peak_db": -12.0},
+                 "speech": {"transcript": "", "has_speech": False, "language": "en"}})
+ae.analyze_clip = fake_analyze
+ae.VideoPreprocessor = lambda *a, **k: None
+ae.ChunkAnalyzer = lambda *a, **k: None
+class _FakeTranscriber:
+    def unload(self): pass
+ae.SpeechTranscriber = lambda *a, **k: _FakeTranscriber()
+j = run_job({"type": "analyze", "project": projectB, "params": {}})
+check("resume analyzes only remaining clips", j["status"] == "done"
+      and ANALYZED == ["DJI_0102.MP4", "DJI_0103.MP4"])
+check("library complete after resume",
+      ae.ChunkLibrary.load_if_valid(pathsB["library"], pairsB) is not None)
+data = client.post("/api/project/open", json={"path": projectB}).get_json()
+check("project open reports complete after resume",
+      data["library"]["exists"] and not data["library"]["partial"]
+      and data["library"]["chunks"] == 3)
+
 print(f"\n{len(failures)} failures")
 sys.exit(1 if failures else 0)

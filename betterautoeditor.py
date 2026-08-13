@@ -352,20 +352,26 @@ class ChunkLibrary:
             for p in pairs
         ]
 
-    def save(self, path, pairs):
+    def save(self, path, pairs, analyzed_sources=None):
+        """analyzed_sources: which source files the chunks cover so far; None
+        means the library is complete (covers every pair)."""
+        if analyzed_sources is None:
+            analyzed_sources = [os.path.basename(p["hires"]) for p in pairs]
         payload = {
             "schema": LIBRARY_SCHEMA,
             "fingerprint": self.fingerprint(pairs),
             "analysis_fps": ANALYSIS_FPS,
             "chunk_duration": CHUNK_DURATION,
+            "analyzed_sources": sorted(analyzed_sources),
             "chunks": self.chunks,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=_json_default)
-        print(f"Chunk library saved to {path} ({len(self.chunks)} chunks)")
+        print(f"Chunk library saved to {path} ({len(self.chunks)} chunks, "
+              f"{len(analyzed_sources)}/{len(pairs)} clips)")
 
     @classmethod
-    def load_if_valid(cls, path, pairs):
+    def _load_payload(cls, path, pairs):
         if not os.path.exists(path):
             return None
         try:
@@ -383,11 +389,43 @@ class ChunkLibrary:
         if payload.get("fingerprint") != cls.fingerprint(pairs):
             print("Library cache ignored: footage changed.")
             return None
+        return payload
+
+    @classmethod
+    def load_if_valid(cls, path, pairs):
+        """A complete library covering every pair, or None."""
+        payload = cls._load_payload(path, pairs)
+        if payload is None:
+            return None
+        all_sources = sorted(os.path.basename(p["hires"]) for p in pairs)
+        # Older caches predate analyzed_sources; they were only written complete.
+        done = sorted(payload.get("analyzed_sources", all_sources))
+        if done != all_sources:
+            print(f"Library cache is partial ({len(done)}/{len(all_sources)} clips) "
+                  "- analysis will resume from where it stopped.")
+            return None
         lib = cls()
         for meta in payload.get("chunks", []):
             lib.chunks.append(meta)
         print(f"Library cache hit: {path} ({len(lib.chunks)} chunks) - skipping video analysis.")
         return lib
+
+    @classmethod
+    def load_resumable(cls, path, pairs):
+        """(library, set of already-analyzed sources) to grow incrementally.
+        A fresh empty library if there is no usable cache."""
+        payload = cls._load_payload(path, pairs)
+        if payload is None:
+            return cls(), set()
+        lib = cls()
+        for meta in payload.get("chunks", []):
+            lib.chunks.append(meta)
+        all_sources = [os.path.basename(p["hires"]) for p in pairs]
+        done = set(payload.get("analyzed_sources", all_sources))
+        if done:
+            print(f"Resuming analysis: {len(done)}/{len(pairs)} clips already in "
+                  f"the library ({len(lib.chunks)} chunks).")
+        return lib, done
 
 
 # ----------------------------------------------------------------------------
@@ -1300,17 +1338,24 @@ def run_pipeline(args):
     load_model()
 
     if library is None:
-        library = ChunkLibrary()
+        library, done_sources = ChunkLibrary.load_resumable(
+            library_path if not args.reanalyze else "", pairs)
         preprocessor = VideoPreprocessor(workdir)
         analyzer = ChunkAnalyzer()
         transcriber = SpeechTranscriber()
         for pair in pairs:
+            source = os.path.basename(pair["hires"])
+            if source in done_sources:
+                print(f"\n=== Skipping {source}: already in the library ===")
+                continue
             analyze_clip(pair, preprocessor, analyzer, transcriber, library, workdir, args.max_chunks)
+            done_sources.add(source)
+            # Incremental checkpoint: an interrupted run resumes from here.
+            library.save(library_path, pairs, analyzed_sources=done_sources)
         transcriber.unload()
         if not library.chunks:
             print("\nNo analyzable chunks found in the footage.")
             return
-        library.save(library_path, pairs)
 
     durations = {c["source"]: c["clip_duration"] for c in library.chunks}
     lrf_by_source = {os.path.basename(p["hires"]): p["lrf"] for p in pairs}

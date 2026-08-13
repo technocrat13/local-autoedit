@@ -65,10 +65,18 @@ async function openProject(path) {
   $("#project").classList.remove("hidden");
   $("#project-name").textContent = data.name;
   const lib = data.library;
-  $("#library-status").textContent = lib.exists
-    ? `library: ${lib.chunks} chunks`
-    : lib.stale ? "footage changed - re-analysis needed" : "not analyzed yet";
+  if (lib.exists) {
+    $("#library-status").textContent = `library: ${lib.chunks} chunks`;
+  } else if (lib.partial) {
+    $("#library-status").textContent =
+      `analyzed ${lib.analyzed_clips}/${lib.total_clips} clips - resume to finish`;
+  } else if (lib.stale) {
+    $("#library-status").textContent = "footage changed - re-analysis needed";
+  } else {
+    $("#library-status").textContent = "not analyzed yet";
+  }
   $("#library-status").className = lib.exists ? "ok" : "warn";
+  $("#btn-analyze").textContent = lib.partial ? "Resume analysis" : "Analyze footage";
   showTab("clips");
   renderVersions();
   await renderClips();
@@ -93,7 +101,9 @@ async function renderClips() {
       `<div class="clip-status" data-clip="${esc(clip.source)}"></div>` +
       (clip.chunks.length
         ? `<details><summary>${clip.chunks.length} chunks</summary><div class="chunks">${chunkRows}</div></details>`
-        : `<div class="hint clip-status-hint" data-clip-hint="${esc(clip.source)}">not analyzed</div>`);
+        : clip.analyzed
+          ? `<div class="hint">analyzed - no notable chunks</div>`
+          : `<div class="hint clip-status-hint" data-clip-hint="${esc(clip.source)}">not analyzed</div>`);
     card.querySelector("input").onchange = (e) => {
       if (e.target.checked) state.selectedSources.add(clip.source);
       else state.selectedSources.delete(clip.source);

@@ -66,8 +66,11 @@ story = {"brief": "day in the life", "themes": ["friends", "beach"],
 
 composer = ae.StoryComposer()
 failures = []
+checks = 0
 
 def check(name, cond):
+    global checks
+    checks += 1
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         failures.append(name)
@@ -194,5 +197,5 @@ selections = composer.compose(lib, story, 15)
 check("garbage LLM -> empty (FallbackSelector takes over in pipeline)",
       selections == [])
 
-print("\n%d checks, %d failures" % (len(failures) if False else 0 or 0, len(failures)))
+print("\n%d checks, %d failures" % (checks, len(failures)))
 sys.exit(1 if failures else 0)
