@@ -96,7 +96,7 @@ WHISPER_COMPUTE = "int8"
 TRANSCRIPT_STORE_CHARS = 500   # cap stored per-chunk transcript length
 TRANSCRIPT_DIGEST_CHARS = 200  # cap transcript length inside the composer digest
 
-LIBRARY_SCHEMA = 2  # v2 adds per-chunk "speech"; older caches are re-analyzed
+LIBRARY_SCHEMA = 3  # v3 stores chunks per clip fingerprint (sticky analysis)
 
 # Qwen3.5's hybrid Gated DeltaNet + Attention architecture has open bitsandbytes
 # compatibility reports as of mid-2026 (load failures / bad output on the 27B
@@ -333,8 +333,14 @@ def get_media_tools():
 # ChunkLibrary - persistent metadata library covering every chunk of every clip
 # ----------------------------------------------------------------------------
 class ChunkLibrary:
+    """Per-clip sticky analysis: each clip's chunks live under that clip's own
+    fingerprint, so adding/removing/renaming one clip never invalidates the
+    others. Entries for clips no longer on disk are kept so the knowledge
+    survives if the clip comes back."""
+
     def __init__(self):
-        self.chunks = []
+        self.chunks = []        # active flat list for the current pairs
+        self.clip_entries = {}  # source -> {"lrf_name", "lrf_size", "chunks"}
 
     def add(self, meta):
         meta["library_id"] = len(self.chunks)
@@ -346,86 +352,108 @@ class ChunkLibrary:
         return None
 
     @staticmethod
-    def fingerprint(pairs):
-        return [
-            {"name": os.path.basename(p["lrf"]), "lrf_size": os.path.getsize(p["lrf"])}
-            for p in pairs
-        ]
+    def clip_fingerprint(pair):
+        return os.path.getsize(pair["lrf"])
 
-    def save(self, path, pairs, analyzed_sources=None):
-        """analyzed_sources: which source files the chunks cover so far; None
-        means the library is complete (covers every pair)."""
-        if analyzed_sources is None:
-            analyzed_sources = [os.path.basename(p["hires"]) for p in pairs]
+    def commit_clip(self, pair):
+        """Sticky one clip's finished analysis to its fingerprint."""
+        source = os.path.basename(pair["hires"])
+        self.clip_entries[source] = {
+            "lrf_name": os.path.basename(pair["lrf"]),
+            "lrf_size": self.clip_fingerprint(pair),
+            "chunks": [c for c in self.chunks if c["source"] == source],
+        }
+
+    def save(self, path):
         payload = {
             "schema": LIBRARY_SCHEMA,
-            "fingerprint": self.fingerprint(pairs),
             "analysis_fps": ANALYSIS_FPS,
             "chunk_duration": CHUNK_DURATION,
-            "analyzed_sources": sorted(analyzed_sources),
-            "chunks": self.chunks,
+            "clips": self.clip_entries,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=_json_default)
-        print(f"Chunk library saved to {path} ({len(self.chunks)} chunks, "
-              f"{len(analyzed_sources)}/{len(pairs)} clips)")
+        total = sum(len(e["chunks"]) for e in self.clip_entries.values())
+        print(f"Chunk library saved to {path} "
+              f"({len(self.clip_entries)} clips, {total} chunks)")
 
     @classmethod
-    def _load_payload(cls, path, pairs):
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception as e:
-            print(f"Could not read library cache {path}: {e}")
-            return None
-        if payload.get("schema") != LIBRARY_SCHEMA:
-            print("Library cache ignored: older schema (no speech data) - re-analyzing.")
-            return None
-        if payload.get("analysis_fps") != ANALYSIS_FPS or payload.get("chunk_duration") != CHUNK_DURATION:
+    def load(cls, path, pairs):
+        """(library, status) for the current pairs. status maps each source to
+        'analyzed' | 'changed' | 'new'; the active chunk list covers only
+        'analyzed' clips, renumbered in pairs order."""
+        lib = cls()
+        payload = None
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception as e:
+                print(f"Could not read library cache {path}: {e}")
+        if payload and (payload.get("analysis_fps") != ANALYSIS_FPS
+                        or payload.get("chunk_duration") != CHUNK_DURATION):
             print("Library cache ignored: analysis settings changed.")
-            return None
-        if payload.get("fingerprint") != cls.fingerprint(pairs):
-            print("Library cache ignored: footage changed.")
-            return None
-        return payload
+            payload = None
+        if payload:
+            schema = payload.get("schema")
+            if schema == LIBRARY_SCHEMA:
+                lib.clip_entries = payload.get("clips", {})
+            elif schema == 2:
+                lib.clip_entries = cls._migrate_v2(payload)
+                if lib.clip_entries:
+                    print(f"Migrated library cache to per-clip format "
+                          f"({len(lib.clip_entries)} clips carried over).")
+            else:
+                print("Library cache ignored: incompatible schema - re-analyzing.")
+        status = {}
+        for pair in pairs:
+            source = os.path.basename(pair["hires"])
+            entry = lib.clip_entries.get(source)
+            if entry is None:
+                status[source] = "new"
+            elif entry.get("lrf_size") != cls.clip_fingerprint(pair):
+                status[source] = "changed"
+            else:
+                status[source] = "analyzed"
+                for meta in entry["chunks"]:
+                    lib.add(meta)
+        return lib, status
+
+    @staticmethod
+    def _migrate_v2(payload):
+        """Old format: one global fingerprint + flat chunk list. Regroup per
+        clip so existing analysis carries over."""
+        sizes = {os.path.splitext(fp["name"])[0]: fp
+                 for fp in payload.get("fingerprint", [])}
+        by_source = {}
+        for meta in payload.get("chunks", []):
+            by_source.setdefault(meta["source"], []).append(meta)
+        all_sources = list(by_source)
+        entries = {}
+        for source in payload.get("analyzed_sources", all_sources):
+            fp = sizes.get(os.path.splitext(source)[0])
+            if fp is None:
+                continue
+            entries[source] = {"lrf_name": fp["name"], "lrf_size": fp["lrf_size"],
+                               "chunks": by_source.get(source, [])}
+        return entries
 
     @classmethod
     def load_if_valid(cls, path, pairs):
-        """A complete library covering every pair, or None."""
-        payload = cls._load_payload(path, pairs)
-        if payload is None:
+        """A library covering every current clip, or None."""
+        if not pairs:
             return None
-        all_sources = sorted(os.path.basename(p["hires"]) for p in pairs)
-        # Older caches predate analyzed_sources; they were only written complete.
-        done = sorted(payload.get("analyzed_sources", all_sources))
-        if done != all_sources:
-            print(f"Library cache is partial ({len(done)}/{len(all_sources)} clips) "
-                  "- analysis will resume from where it stopped.")
+        lib, status = cls.load(path, pairs)
+        pending = [s for s, st in status.items() if st != "analyzed"]
+        if pending:
+            done = len(pairs) - len(pending)
+            if done:
+                print(f"Library covers {done}/{len(pairs)} clips - "
+                      "the rest still need analysis.")
             return None
-        lib = cls()
-        for meta in payload.get("chunks", []):
-            lib.chunks.append(meta)
-        print(f"Library cache hit: {path} ({len(lib.chunks)} chunks) - skipping video analysis.")
+        print(f"Library cache hit: {path} ({len(lib.chunks)} chunks) "
+              "- skipping video analysis.")
         return lib
-
-    @classmethod
-    def load_resumable(cls, path, pairs):
-        """(library, set of already-analyzed sources) to grow incrementally.
-        A fresh empty library if there is no usable cache."""
-        payload = cls._load_payload(path, pairs)
-        if payload is None:
-            return cls(), set()
-        lib = cls()
-        for meta in payload.get("chunks", []):
-            lib.chunks.append(meta)
-        all_sources = [os.path.basename(p["hires"]) for p in pairs]
-        done = set(payload.get("analyzed_sources", all_sources))
-        if done:
-            print(f"Resuming analysis: {len(done)}/{len(pairs)} clips already in "
-                  f"the library ({len(lib.chunks)} chunks).")
-        return lib, done
 
 
 # ----------------------------------------------------------------------------
@@ -1338,20 +1366,22 @@ def run_pipeline(args):
     load_model()
 
     if library is None:
-        library, done_sources = ChunkLibrary.load_resumable(
+        library, status = ChunkLibrary.load(
             library_path if not args.reanalyze else "", pairs)
         preprocessor = VideoPreprocessor(workdir)
         analyzer = ChunkAnalyzer()
         transcriber = SpeechTranscriber()
         for pair in pairs:
             source = os.path.basename(pair["hires"])
-            if source in done_sources:
+            if status[source] == "analyzed":
                 print(f"\n=== Skipping {source}: already in the library ===")
                 continue
+            if status[source] == "changed":
+                print(f"\n=== {source} changed on disk - re-analyzing ===")
             analyze_clip(pair, preprocessor, analyzer, transcriber, library, workdir, args.max_chunks)
-            done_sources.add(source)
+            library.commit_clip(pair)
             # Incremental checkpoint: an interrupted run resumes from here.
-            library.save(library_path, pairs, analyzed_sources=done_sources)
+            library.save(library_path)
         transcriber.unload()
         if not library.chunks:
             print("\nNo analyzable chunks found in the footage.")

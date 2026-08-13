@@ -94,7 +94,9 @@ for i in range(8):
              "speech": {"transcript": "", "has_speech": False, "language": "en"}})
 paths = webapp.project_paths(project)
 os.makedirs(paths["autoedit"], exist_ok=True)
-lib.save(paths["library"], pairs)
+for p in pairs:
+    lib.commit_clip(p)
+lib.save(paths["library"])
 
 # fake compose: record the library object it saw, return chunk 0 + 5
 SEEN = {}
@@ -233,7 +235,7 @@ check("both jobs complete after gate",
       client.get(f"/api/jobs/{a}").get_json()["status"] == "done"
       and client.get(f"/api/jobs/{b}").get_json()["status"] == "done")
 
-# ---- 9. incremental library: partial save + resume -------------------------------
+# ---- 9. sticky per-clip library: partial, resume, add/remove/change --------------
 projectB = os.path.join(root, "dayB")
 os.makedirs(projectB)
 for stem in ("DJI_0101", "DJI_0102", "DJI_0103"):
@@ -252,13 +254,15 @@ libB.add({"source": "DJI_0101.MP4",
           "interest_score": 0.4, "clip_duration": 20.0,
           "audio": {"loudness_peak_db": -12.0},
           "speech": {"transcript": "", "has_speech": False, "language": "en"}})
-libB.save(pathsB["library"], pairsB, analyzed_sources={"DJI_0101.MP4"})
+libB.commit_clip(pairsB[0])
+libB.save(pathsB["library"])
 
 check("partial library rejected by load_if_valid",
       ae.ChunkLibrary.load_if_valid(pathsB["library"], pairsB) is None)
-rlib, rdone = ae.ChunkLibrary.load_resumable(pathsB["library"], pairsB)
-check("load_resumable returns chunks + done set",
-      len(rlib.chunks) == 1 and rdone == {"DJI_0101.MP4"})
+rlib, rstatus = ae.ChunkLibrary.load(pathsB["library"], pairsB)
+check("load returns chunks + per-clip status",
+      len(rlib.chunks) == 1 and rstatus["DJI_0101.MP4"] == "analyzed"
+      and rstatus["DJI_0102.MP4"] == "new" and rstatus["DJI_0103.MP4"] == "new")
 
 data = client.post("/api/project/open", json={"path": projectB}).get_json()
 check("project open reports partial library",
@@ -299,6 +303,77 @@ data = client.post("/api/project/open", json={"path": projectB}).get_json()
 check("project open reports complete after resume",
       data["library"]["exists"] and not data["library"]["partial"]
       and data["library"]["chunks"] == 3)
+
+# add a new clip: only that clip needs analysis
+for ext in (".LRF", ".MP4"):
+    with open(os.path.join(projectB, "DJI_0104" + ext), "wb") as f:
+        f.write(b"\x00" * 128)
+pairsB = ae.get_video_pairs(projectB)
+data = client.post("/api/project/open", json={"path": projectB}).get_json()
+check("new clip -> partial, existing analysis kept",
+      data["library"]["partial"] and data["library"]["analyzed_clips"] == 3
+      and data["library"]["total_clips"] == 4 and data["library"]["chunks"] == 3)
+ANALYZED.clear()
+j = run_job({"type": "analyze", "project": projectB, "params": {}})
+check("only the new clip analyzed", j["status"] == "done"
+      and ANALYZED == ["DJI_0104.MP4"])
+
+# remove a clip: library stays valid for the remaining clips
+for ext in (".LRF", ".MP4"):
+    os.remove(os.path.join(projectB, "DJI_0102" + ext))
+pairsB = ae.get_video_pairs(projectB)
+data = client.post("/api/project/open", json={"path": projectB}).get_json()
+check("removed clip -> library still complete for the rest",
+      data["library"]["exists"] and data["library"]["analyzed_clips"] == 3
+      and data["library"]["chunks"] == 3)
+rlib, _ = ae.ChunkLibrary.load(pathsB["library"], pairsB)
+check("removed clip's chunks absent, knowledge retained on disk",
+      all(c["source"] != "DJI_0102.MP4" for c in rlib.chunks)
+      and "DJI_0102.MP4" in rlib.clip_entries)
+
+# change a clip on disk: only that clip flagged for re-analysis
+with open(os.path.join(projectB, "DJI_0103.LRF"), "wb") as f:
+    f.write(b"\x00" * 999)
+pairsB = ae.get_video_pairs(projectB)
+clipsB = client.get(f"/api/project/clips?path={projectB}").get_json()
+byname = {c["source"]: c for c in clipsB["clips"]}
+check("changed clip flagged, others untouched",
+      byname["DJI_0103.MP4"]["changed"] and not byname["DJI_0103.MP4"]["analyzed"]
+      and byname["DJI_0101.MP4"]["analyzed"] and byname["DJI_0104.MP4"]["analyzed"])
+ANALYZED.clear()
+j = run_job({"type": "analyze", "project": projectB, "params": {}})
+check("only the changed clip re-analyzed", j["status"] == "done"
+      and ANALYZED == ["DJI_0103.MP4"])
+
+# library ids stay contiguous for the composer after all the churn
+rlib, rstatus = ae.ChunkLibrary.load(pathsB["library"], pairsB)
+check("active chunks renumbered contiguously",
+      [c["library_id"] for c in rlib.chunks] == list(range(len(rlib.chunks)))
+      and all(rlib.by_id(c["library_id"]) is c for c in rlib.chunks))
+
+# v2 flat-format cache migrates instead of forcing re-analysis
+projectC = os.path.join(root, "dayC")
+os.makedirs(projectC)
+for ext in (".LRF", ".MP4"):
+    with open(os.path.join(projectC, "DJI_0201" + ext), "wb") as f:
+        f.write(b"\x00" * 128)
+pairsC = ae.get_video_pairs(projectC)
+pathsC = webapp.project_paths(projectC)
+os.makedirs(pathsC["autoedit"], exist_ok=True)
+with open(pathsC["library"], "w") as f:
+    json.dump({"schema": 2, "analysis_fps": ae.ANALYSIS_FPS,
+               "chunk_duration": ae.CHUNK_DURATION,
+               "fingerprint": [{"name": "DJI_0201.LRF", "lrf_size": 128}],
+               "analyzed_sources": ["DJI_0201.MP4"],
+               "chunks": [{"source": "DJI_0201.MP4", "library_id": 0,
+                           "start": 0.0, "end": 5.0,
+                           "one_line_summary": "old", "interest_score": 0.5,
+                           "clip_duration": 20.0,
+                           "speech": {"transcript": "", "has_speech": False}}]}, f)
+mlib = ae.ChunkLibrary.load_if_valid(pathsC["library"], pairsC)
+check("v2 cache migrates to sticky format",
+      mlib is not None and len(mlib.chunks) == 1
+      and mlib.clip_entries["DJI_0201.MP4"]["lrf_size"] == 128)
 
 print(f"\n{len(failures)} failures")
 sys.exit(1 if failures else 0)

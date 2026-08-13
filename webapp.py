@@ -184,14 +184,14 @@ def job_analyze(job):
         raise RuntimeError("No LRF/MP4 pairs found in this folder.")
     engine.load_model()
     os.makedirs(paths["autoedit"], exist_ok=True)
-    library, done_set = engine.ChunkLibrary.load_resumable(paths["library"], pairs)
+    library, status = engine.ChunkLibrary.load(paths["library"], pairs)
     preprocessor = engine.VideoPreprocessor(WORKDIR)
     analyzer = engine.ChunkAnalyzer()
     transcriber = engine.SpeechTranscriber()
-    done = sorted(done_set)
+    done = sorted(s for s, st in status.items() if st == "analyzed")
     for i, pair in enumerate(pairs):
         source = os.path.basename(pair["hires"])
-        if source in done_set:
+        if status[source] == "analyzed":
             continue
         with JOBS_LOCK:
             job["progress"] = {"done": list(done), "current": source,
@@ -199,10 +199,10 @@ def job_analyze(job):
         set_stage(job, f"analyzing {source} ({i + 1}/{len(pairs)})")
         engine.analyze_clip(pair, preprocessor, analyzer, transcriber,
                             library, WORKDIR, None)
-        done_set.add(source)
-        done = sorted(done_set)
+        library.commit_clip(pair)
+        done = sorted(done + [source])
         # Incremental checkpoint: a stopped job resumes from the next clip.
-        library.save(paths["library"], pairs, analyzed_sources=done_set)
+        library.save(paths["library"])
     with JOBS_LOCK:
         job["progress"] = {"done": done, "current": None,
                            "total": len(pairs), "chunks": len(library.chunks)}
@@ -217,17 +217,25 @@ def job_compose(job):
     params = job["params"]
     paths = project_paths(project)
     pairs = engine.get_video_pairs(project)
-    library = engine.ChunkLibrary.load_if_valid(paths["library"], pairs)
-    if library is None:
-        raise RuntimeError("No valid chunk library - run Analyze first "
-                           "(or footage changed since analysis).")
+    library, status = engine.ChunkLibrary.load(paths["library"], pairs)
+    if not library.chunks:
+        raise RuntimeError("No analyzed clips yet - run Analyze first.")
 
     sources = params.get("sources") or []
     if sources:
+        pending = [s for s in sources if status.get(s) != "analyzed"]
+        if pending:
+            raise RuntimeError("Selected clips not analyzed yet: "
+                               + ", ".join(pending))
         chunks = [c for c in library.chunks if c["source"] in sources]
         if not chunks:
             raise RuntimeError("Selected clips have no analyzed chunks.")
         library = LibraryView(chunks)
+    else:
+        pending = [s for s, st in status.items() if st != "analyzed"]
+        if pending:
+            print(f"Note: composing from analyzed clips only - "
+                  f"{len(pending)} clip(s) still pending analysis.")
     brief = params.get("brief") or engine.DEFAULT_BRIEF
     target_cuts = int(params.get("target_cuts") or 15)
     margin = max(2.0, min(5.0, float(params.get("margin") or 3.0)))
@@ -339,21 +347,21 @@ def api_project_open():
     project = safe_path((request.json or {}).get("path"))
     pairs = engine.get_video_pairs(project)
     paths = project_paths(project)
-    library, done = (engine.ChunkLibrary.load_resumable(paths["library"], pairs)
-                     if pairs else (None, set()))
+    library, status = (engine.ChunkLibrary.load(paths["library"], pairs)
+                       if pairs else (engine.ChunkLibrary(), {}))
     total = len(pairs)
-    complete = bool(pairs) and len(done) == total
-    library_stale = not done and os.path.exists(paths["library"])
+    analyzed = sum(1 for st in status.values() if st == "analyzed")
+    changed = sum(1 for st in status.values() if st == "changed")
     return jsonify({
         "project": project,
         "name": os.path.basename(project),
         "pairs": [{"source": os.path.basename(p["hires"]),
                    "lrf": p["lrf"], "hires": p["hires"]} for p in pairs],
-        "library": {"exists": complete,
-                    "partial": bool(done) and not complete,
-                    "analyzed_clips": len(done), "total_clips": total,
-                    "stale": library_stale,
-                    "chunks": len(library.chunks) if library else 0},
+        "library": {"exists": bool(pairs) and analyzed == total,
+                    "partial": 0 < analyzed < total,
+                    "analyzed_clips": analyzed, "total_clips": total,
+                    "changed_clips": changed,
+                    "chunks": len(library.chunks)},
         "versions": versions_with_files(project),
     })
 
@@ -363,25 +371,26 @@ def api_project_clips():
     project = safe_path(request.args.get("path"))
     pairs = engine.get_video_pairs(project)
     paths = project_paths(project)
-    library, done = (engine.ChunkLibrary.load_resumable(paths["library"], pairs)
-                     if pairs else (None, set()))
+    library, status = (engine.ChunkLibrary.load(paths["library"], pairs)
+                       if pairs else (engine.ChunkLibrary(), {}))
     by_source = {}
-    if library:
-        for c in library.chunks:
-            by_source.setdefault(c["source"], []).append({
-                "library_id": c["library_id"], "start": c["start"], "end": c["end"],
-                "scene": c.get("scene", ""), "summary": c.get("one_line_summary", ""),
-                "interest": c.get("interest_score", 0.0),
-                "transcript": c.get("speech", {}).get("transcript", "")})
+    for c in library.chunks:
+        by_source.setdefault(c["source"], []).append({
+            "library_id": c["library_id"], "start": c["start"], "end": c["end"],
+            "scene": c.get("scene", ""), "summary": c.get("one_line_summary", ""),
+            "interest": c.get("interest_score", 0.0),
+            "transcript": c.get("speech", {}).get("transcript", "")})
     clips = []
     for p in pairs:
         source = os.path.basename(p["hires"])
         chunks = by_source.get(source, [])
         clips.append({"source": source,
                       "duration": chunks[-1]["end"] if chunks else None,
-                      "analyzed": source in done,
+                      "analyzed": status.get(source) == "analyzed",
+                      "changed": status.get(source) == "changed",
                       "chunks": chunks})
-    return jsonify({"clips": clips, "analyzed_clips": len(done),
+    analyzed = sum(1 for c in clips if c["analyzed"])
+    return jsonify({"clips": clips, "analyzed_clips": analyzed,
                     "total_clips": len(pairs)})
 
 
