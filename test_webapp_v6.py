@@ -375,5 +375,49 @@ check("v2 cache migrates to sticky format",
       mlib is not None and len(mlib.chunks) == 1
       and mlib.clip_entries["DJI_0201.MP4"]["lrf_size"] == 128)
 
+# ---- 10. suggest job: AI-assisted add-clip picker --------------------------------
+# projectB library ids after churn: contiguous 0..N-1 across remaining clips
+rlib, _ = ae.ChunkLibrary.load(pathsB["library"], pairsB)
+all_ids = [c["library_id"] for c in rlib.chunks]
+
+ae._llm_text = lambda system, user, max_tokens: json.dumps(
+    {"selections": [{"chunk_id": all_ids[0], "reason": "matches the query"},
+                    {"chunk_id": 999, "reason": "hallucinated id"},
+                    {"chunk_id": all_ids[0], "reason": "duplicate"}]})
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"query": "the walking moment", "candidate_ids": all_ids}})
+check("suggest returns validated, deduped picks", j["status"] == "done"
+      and j["result"]["picks"] == [{"library_id": all_ids[0],
+                                    "reason": "matches the query"}])
+
+ae._llm_text = lambda system, user, max_tokens: "total garbage, not json at all"
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"query": "anything", "candidate_ids": all_ids}})
+check("suggest survives garbage LLM output",
+      j["status"] == "done" and j["result"]["picks"] == [])
+
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"query": "anything", "candidate_ids": []}})
+check("suggest with empty window errors cleanly",
+      j["status"] == "error" and "window" in j["error"])
+
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"query": "", "candidate_ids": all_ids}})
+check("suggest with empty query errors cleanly", j["status"] == "error")
+
+# manually-added cut (picker output shape) round-trips through /api/edl
+res = client.post("/api/edl", json={
+    "path": projectB, "base_version": None,
+    "cuts": [{"source_file": pairsB[0]["hires"], "lrf_file": pairsB[0]["lrf"],
+              "source": os.path.basename(pairsB[0]["hires"]),
+              "start": 2.5, "end": 7.5, "role": "manual", "beat": "",
+              "summary": "added by picker", "speech": "hello"}]})
+check("manually added cut saves as new version", res.status_code == 200)
+with open(webapp.edl_path(projectB, res.get_json()["version"])) as f:
+    saved = json.load(f)
+check("added cut round-trips with exact bounds",
+      saved[0]["start"] == 2.5 and saved[0]["end"] == 7.5
+      and saved[0]["role"] == "manual" and saved[0]["speech"] == "hello")
+
 print(f"\n{len(failures)} failures")
 sys.exit(1 if failures else 0)

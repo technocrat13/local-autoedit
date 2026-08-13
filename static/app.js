@@ -6,7 +6,8 @@ const state = {
   browsePath: window.ROOT,
   project: null,          // { project, name, pairs, library, versions }
   selectedSources: new Set(),
-  edl: null,              // { version, cuts: [{cut, enabled}] }
+  edl: null,              // { version, cuts: [{cut, enabled, added}], allChunks }
+  picker: null,           // { gap, showAll, checked, reasons, aiStatus }
   pollTimer: null,
   activeJob: null,
 };
@@ -169,20 +170,41 @@ async function refreshProject() {
 // ---------------------------------------------------------------------------
 async function loadEdl(version) {
   const data = await api(`/api/edl?path=${encodeURIComponent(state.project.project)}&version=${version}`);
-  state.edl = { version, cuts: data.cuts.map((cut) => ({ cut, enabled: true })) };
+  const clipData = await api(`/api/project/clips?path=${encodeURIComponent(state.project.project)}`);
+  const allChunks = [];
+  for (const clip of clipData.clips) {
+    for (const c of clip.chunks) allChunks.push({ ...c, source: clip.source });
+  }
+  allChunks.sort((a, b) => posCmp([a.source, a.start], [b.source, b.start]));
+  state.edl = {
+    version,
+    cuts: data.cuts.map((cut) => ({ cut, enabled: true })),
+    allChunks,
+  };
+  state.picker = null;
   $("#edl-tab").disabled = false;
   $("#edl-title").textContent = `Editing v${version} (${data.cuts.length} cuts)`;
   renderEdl();
   showTab("edl");
 }
 
+function posCmp(a, b) {
+  return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1];
+}
+
+function lrfName(source) {
+  const pair = state.project.pairs.find((p) => p.source === source);
+  return pair ? pair.lrf.split(/[\\/]/).pop() : null;
+}
+
 function renderEdl() {
   const tbody = $("#edl-table tbody");
   tbody.innerHTML = "";
+  tbody.appendChild(insertRow(0));
   state.edl.cuts.forEach((row, idx) => {
     const c = row.cut;
     const tr = document.createElement("tr");
-    tr.className = row.enabled ? "" : "disabled-cut";
+    tr.className = (row.enabled ? "" : "disabled-cut") + (row.added ? " added-cut" : "");
     tr.draggable = true;
     tr.dataset.idx = idx;
     tr.innerHTML =
@@ -193,14 +215,20 @@ function renderEdl() {
       `<td><input class="num" type="number" step="0.5" value="${c.end.toFixed(1)}"></td>` +
       `<td>${esc(c.role || "")}${c.beat ? " / " + esc(c.beat) : ""}</td>` +
       `<td class="summary-cell">${esc(c.summary || "")}` +
-      (c.speech ? `<div class="speech">&ldquo;${esc(c.speech)}&rdquo;</div>` : "") + `</td>`;
+      (c.speech ? `<div class="speech">&ldquo;${esc(c.speech)}&rdquo;</div>` : "") + `</td>` +
+      `<td><button class="cut-play" title="preview this cut from the LRF proxy">&#9654;</button></td>`;
     tr.querySelector('input[type="checkbox"]').onchange = (e) => {
       row.enabled = e.target.checked;
-      tr.className = row.enabled ? "" : "disabled-cut";
+      tr.className = (row.enabled ? "" : "disabled-cut") + (row.added ? " added-cut" : "");
     };
     const [startInput, endInput] = tr.querySelectorAll(".num");
     startInput.onchange = () => { c.start = parseFloat(startInput.value); };
     endInput.onchange = () => { c.end = parseFloat(endInput.value); };
+    tr.querySelector(".cut-play").onclick = () => {
+      const file = c.lrf_file ? c.lrf_file.split(/[\\/]/).pop() : lrfName(c.source);
+      if (!file) return alert("No LRF proxy known for this cut.");
+      playVideo(file, c.start, c.end);
+    };
     tr.ondragstart = (e) => e.dataTransfer.setData("text/plain", idx);
     tr.ondragover = (e) => e.preventDefault();
     tr.ondrop = (e) => {
@@ -210,10 +238,198 @@ function renderEdl() {
       if (from === to) return;
       const [moved] = state.edl.cuts.splice(from, 1);
       state.edl.cuts.splice(to, 0, moved);
+      if (state.picker) state.picker = null;
       renderEdl();
     };
     tbody.appendChild(tr);
+    tbody.appendChild(insertRow(idx + 1));
   });
+  renderPicker();
+}
+
+function insertRow(gap) {
+  const tr = document.createElement("tr");
+  tr.className = "insert-row" + (state.picker && state.picker.gap === gap ? " active" : "");
+  const cols = $("#edl-table thead tr").children.length;
+  tr.innerHTML = `<td colspan="${cols}"><button class="linkish">+ add clip here</button></td>`;
+  tr.querySelector("button").onclick = () => openPicker(gap);
+  return tr;
+}
+
+// ---------------------------------------------------------------------------
+// Add-clip picker
+// ---------------------------------------------------------------------------
+function pickerWindow(gap) {
+  const enabled = state.edl.cuts
+    .map((row, idx) => ({ row, idx }))
+    .filter((e) => e.row.enabled);
+  const prev = [...enabled].reverse().find((e) => e.idx < gap);
+  const next = enabled.find((e) => e.idx >= gap);
+  const lo = prev ? [prev.row.cut.source, prev.row.cut.end] : null;
+  const hi = next ? [next.row.cut.source, next.row.cut.start] : null;
+  return { lo, hi, prev: prev && prev.row.cut, next: next && next.row.cut };
+}
+
+function chunkInEdit(chunk) {
+  return state.edl.cuts.some((r) => r.enabled && r.cut.source === chunk.source
+    && r.cut.start < chunk.end && chunk.start < r.cut.end);
+}
+
+function pickerCandidates(gap, showAll) {
+  if (showAll) return state.edl.allChunks.filter((c) => !chunkInEdit(c));
+  const { lo, hi } = pickerWindow(gap);
+  if (lo && hi && posCmp(lo, hi) >= 0) return [];
+  return state.edl.allChunks.filter((c) =>
+    (!lo || posCmp([c.source, c.start], lo) >= 0) &&
+    (!hi || posCmp([c.source, c.end], hi) <= 0));
+}
+
+function openPicker(gap) {
+  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, aiStatus: "" };
+  renderEdl();
+  $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderPicker() {
+  const box = $("#edl-picker");
+  const p = state.picker;
+  if (!p) { box.classList.add("hidden"); box.innerHTML = ""; return; }
+  box.classList.remove("hidden");
+  const { prev, next } = pickerWindow(p.gap);
+  const candidates = pickerCandidates(p.gap, p.showAll);
+  const where = p.showAll
+    ? "anywhere (unused chunks)"
+    : `between ${prev ? `${esc(prev.source)} @${prev.end.toFixed(0)}s` : "the start"}` +
+      ` and ${next ? `${esc(next.source)} @${next.start.toFixed(0)}s` : "the end"}`;
+
+  box.innerHTML =
+    `<div class="picker-head"><strong>Add clip ${where}</strong>` +
+    `<button id="picker-close" class="linkish">close</button></div>` +
+    `<div class="picker-ai">` +
+    `<input id="picker-query" type="text" placeholder="describe the moment to add, e.g. 'where we order coffee'">` +
+    `<button id="picker-suggest"${candidates.length ? "" : " disabled"}>Find with AI</button>` +
+    `<span id="picker-ai-status" class="hint">${esc(p.aiStatus)}</span></div>` +
+    (candidates.length
+      ? `<div class="picker-grid">` + candidates.map((c) => {
+          const checked = p.checked.has(c.library_id);
+          const reason = p.reasons[c.library_id];
+          return `<div class="pick-card${checked ? " picked" : ""}" data-lid="${c.library_id}">` +
+            `<img loading="lazy" src="/api/thumb?path=${encodeURIComponent(state.project.project)}&clip=${encodeURIComponent(c.source)}" alt="">` +
+            `<div class="pick-info">` +
+            `<div><span class="t">${esc(c.source)} ${c.start.toFixed(0)}-${c.end.toFixed(0)}s</span>` +
+            ` <span class="i">i=${(c.interest || 0).toFixed(2)}</span>` +
+            (chunkInEdit(c) ? ` <span class="badge waiting">in edit</span>` : "") + `</div>` +
+            `<div>${esc(c.summary)}</div>` +
+            (c.transcript ? `<div class="speech">&ldquo;${esc(c.transcript)}&rdquo;</div>` : "") +
+            (reason ? `<div class="ai-reason">AI: ${esc(reason)}</div>` : "") +
+            `</div>` +
+            `<div class="pick-actions">` +
+            `<button class="pick-play" title="preview">&#9654;</button>` +
+            `<input type="checkbox" ${checked ? "checked" : ""}>` +
+            `</div></div>`;
+        }).join("") + `</div>`
+      : `<div class="hint">No unused chunks fall between these two cuts.</div>`) +
+    `<div class="picker-foot">` +
+    `<label class="inline"><input id="picker-showall" type="checkbox" ${p.showAll ? "checked" : ""}> show all unused chunks</label>` +
+    `<button id="picker-add" ${p.checked.size ? "" : "disabled"}>Add selected (${p.checked.size})</button>` +
+    `</div>`;
+
+  $("#picker-close").onclick = () => { state.picker = null; renderEdl(); };
+  $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
+  $("#picker-suggest").onclick = () => runSuggest(candidates);
+  $("#picker-add").onclick = () => addPicked(candidates);
+  box.querySelectorAll(".pick-card").forEach((card) => {
+    const lid = parseInt(card.dataset.lid, 10);
+    const chunk = candidates.find((c) => c.library_id === lid);
+    card.querySelector(".pick-play").onclick = () => {
+      const file = lrfName(chunk.source);
+      if (!file) return alert("No LRF proxy known for this clip.");
+      playVideo(file, chunk.start, chunk.end);
+    };
+    card.querySelector('input[type="checkbox"]').onchange = (e) => {
+      if (e.target.checked) p.checked.add(lid);
+      else p.checked.delete(lid);
+      renderPicker();
+    };
+  });
+}
+
+async function runSuggest(candidates) {
+  const p = state.picker;
+  const query = $("#picker-query").value.trim();
+  if (!query) return alert("Describe the moment you want to add first.");
+  p.query = query;
+  p.aiStatus = "submitting…";
+  renderPicker();
+  $("#picker-query").value = query;
+  try {
+    const data = await api("/api/jobs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "suggest", project: state.project.project,
+        params: { query, candidate_ids: candidates.map((c) => c.library_id) },
+      }),
+    });
+    pollSuggest(data.job_id);
+  } catch (e) {
+    p.aiStatus = "failed: " + e.message;
+    renderPicker();
+  }
+}
+
+function pollSuggest(jobId) {
+  const p = state.picker;
+  const timer = setInterval(async () => {
+    if (state.picker !== p) return clearInterval(timer);
+    try {
+      const j = await api(`/api/jobs/${jobId}`);
+      p.aiStatus = j.stage || j.status;
+      if (j.status === "done") {
+        clearInterval(timer);
+        const picks = (j.result && j.result.picks) || [];
+        p.aiStatus = picks.length
+          ? `AI picked ${picks.length} chunk(s) for "${p.query}"`
+          : `AI found nothing matching "${p.query}"`;
+        for (const pick of picks) {
+          p.checked.add(pick.library_id);
+          p.reasons[pick.library_id] = pick.reason;
+        }
+      } else if (j.status === "error") {
+        clearInterval(timer);
+        p.aiStatus = "failed: " + j.error;
+      }
+      renderPicker();
+      if (p.query) $("#picker-query").value = p.query;
+    } catch (e) {
+      clearInterval(timer);
+      p.aiStatus = "failed: " + e.message;
+      renderPicker();
+    }
+  }, 1000);
+}
+
+function addPicked(candidates) {
+  const p = state.picker;
+  const chosen = candidates
+    .filter((c) => p.checked.has(c.library_id))
+    .sort((a, b) => posCmp([a.source, a.start], [b.source, b.start]));
+  const pairBySource = Object.fromEntries(state.project.pairs.map((x) => [x.source, x]));
+  const rows = chosen.map((c) => {
+    const pair = pairBySource[c.source] || {};
+    return {
+      enabled: true,
+      added: true,
+      cut: {
+        source_file: pair.hires || "", lrf_file: pair.lrf || "",
+        source: c.source, start: c.start, end: c.end,
+        role: "manual", beat: "", summary: c.summary || "",
+        speech: c.transcript || "",
+      },
+    };
+  });
+  state.edl.cuts.splice(p.gap, 0, ...rows);
+  state.picker = null;
+  renderEdl();
 }
 
 async function saveEdl() {
@@ -224,6 +440,8 @@ async function saveEdl() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: state.project.project, base_version: state.edl.version, cuts }),
     });
+    state.picker = null;
+    $("#edl-picker").classList.add("hidden");
     await refreshProject();
     showTab("versions");
     alert(`Saved as v${data.version} - render a preview or finalize it from the Versions tab.`);
@@ -307,11 +525,26 @@ function updateClipStatuses(progress) {
 // ---------------------------------------------------------------------------
 // Video modal
 // ---------------------------------------------------------------------------
-function playVideo(file) {
+let segmentWatcher = null;
+
+function playVideo(file, start, end) {
   const url = `/api/media?path=${encodeURIComponent(state.project.project)}&file=${encodeURIComponent(file)}`;
-  $("#player").src = url;
+  const player = $("#player");
+  if (segmentWatcher) {
+    player.removeEventListener("timeupdate", segmentWatcher);
+    segmentWatcher = null;
+  }
+  player.src = url;
+  if (start !== undefined) {
+    player.addEventListener("loadedmetadata", () => { player.currentTime = start; },
+      { once: true });
+    if (end !== undefined) {
+      segmentWatcher = () => { if (player.currentTime >= end) player.pause(); };
+      player.addEventListener("timeupdate", segmentWatcher);
+    }
+  }
   $("#video-modal").classList.remove("hidden");
-  $("#player").play().catch(() => {});
+  player.play().catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +571,13 @@ $("#btn-compose").onclick = () => startJob("compose", {
 $("#btn-edl-save").onclick = saveEdl;
 $("#job-close").onclick = () => $("#job-drawer").classList.add("hidden");
 $("#video-close").onclick = () => {
-  $("#player").pause();
-  $("#player").src = "";
+  const player = $("#player");
+  if (segmentWatcher) {
+    player.removeEventListener("timeupdate", segmentWatcher);
+    segmentWatcher = null;
+  }
+  player.pause();
+  player.src = "";
   $("#video-modal").classList.add("hidden");
 };
 
