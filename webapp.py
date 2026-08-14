@@ -156,22 +156,6 @@ def set_stage(job, stage):
     print(f"--- {stage} ---")
 
 
-def faststart_remux(path):
-    """Move the moov atom to the front so browsers start playback instantly."""
-    ffmpeg, _ = engine.get_media_tools()
-    if not ffmpeg or not os.path.exists(path):
-        return
-    tmp = path + ".faststart.mp4"
-    result = subprocess.run(
-        [ffmpeg, "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", tmp],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode == 0 and os.path.exists(tmp):
-        os.replace(tmp, path)
-    elif os.path.exists(tmp):
-        os.remove(tmp)
-
-
 PREVIEW_KWARGS = {"source_key": "lrf_file", "preset": "ultrafast",
                   "bitrate": engine.PREVIEW_BITRATE}
 
@@ -265,7 +249,6 @@ def job_compose(job):
     preview = render_path(project, version, "preview")
     if not editor.render(edit_plan, preview, **PREVIEW_KWARGS):
         raise RuntimeError("Preview render produced no clips.")
-    faststart_remux(preview)
     return {"version": version, "cut_count": len(edit_plan)}
 
 
@@ -278,8 +261,6 @@ def job_render(job, kind):
     kwargs = PREVIEW_KWARGS if kind == "preview" else {}
     if not engine.render_from_edl(src_edl, out, WORKDIR, **kwargs):
         raise RuntimeError(f"Render from {os.path.basename(src_edl)} failed.")
-    if kind == "preview":
-        faststart_remux(out)
     return {"version": version, "output": out}
 
 

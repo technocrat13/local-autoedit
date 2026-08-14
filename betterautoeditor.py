@@ -17,7 +17,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
-from moviepy import VideoFileClip, concatenate_videoclips
 from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 
 try:
@@ -327,6 +326,26 @@ def get_media_tools():
     if FFMPEG_BIN is None:
         FFMPEG_BIN, FFPROBE_BIN = _find_media_tools()
     return FFMPEG_BIN, FFPROBE_BIN
+
+
+_NVENC_AVAILABLE = None
+
+
+def nvenc_available():
+    """Functional NVENC probe (encoder can be compiled in but lack a driver)."""
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is None:
+        ffmpeg, _ = get_media_tools()
+        result = subprocess.run(
+            [ffmpeg, "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True, check=False,
+        )
+        _NVENC_AVAILABLE = result.returncode == 0
+        print("NVENC hardware encoder: "
+              + ("available - rendering on the GPU." if _NVENC_AVAILABLE
+                 else "not available - rendering on the CPU (libx264)."))
+    return _NVENC_AVAILABLE
 
 
 # ----------------------------------------------------------------------------
@@ -1198,45 +1217,71 @@ class FinalEditor:
 
     def render(self, edit_plan, output_path, source_key="source_file",
                preset=None, bitrate=FINAL_BITRATE):
-        final_clips = []
-        open_sources = {}
-        try:
-            for cut in edit_plan:
-                src = cut.get(source_key)
-                if not src:
-                    continue
-                if src not in open_sources:
-                    open_sources[src] = VideoFileClip(src)
-                main_clip = open_sources[src]
-                if cut["start"] >= main_clip.duration:
-                    continue
-                end = min(cut["end"], main_clip.duration)
-                final_clips.append(main_clip.subclipped(cut["start"], end))
+        """Pure-ffmpeg render: encode each cut as its own segment (NVENC on the
+        GPU when available), then concat losslessly. Replaces moviepy, which
+        piped every frame through Python and encoded 4K on the CPU (hours for
+        minutes of video)."""
+        ffmpeg, _ = get_media_tools()
+        if nvenc_available():
+            # p1 = fastest NVENC preset (previews), p5 = quality (finals)
+            video_args = ["-c:v", "h264_nvenc", "-preset", "p1" if preset else "p5",
+                          "-rc", "vbr", "-b:v", bitrate]
+        else:
+            video_args = ["-c:v", "libx264", "-preset", preset or "medium",
+                          "-b:v", bitrate]
+        # Uniform audio so the concat demuxer accepts every segment.
+        audio_args = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
-            if not final_clips:
-                print("\nNo clips survived selection.")
-                return False
+        t0 = time.time()
+        durations = {}
+        segments = []
+        for i, cut in enumerate(edit_plan):
+            src = cut.get(source_key)
+            if not src:
+                continue
+            if src not in durations:
+                durations[src] = VideoPreprocessor.probe_duration(src)
+            duration = durations[src]
+            if duration and cut["start"] >= duration:
+                continue
+            end = min(cut["end"], duration) if duration else cut["end"]
+            seg = self.workdir.file(f"seg_{i:04d}.mp4")
+            print(f"Encoding cut {i + 1}/{len(edit_plan)}: "
+                  f"{os.path.basename(src)} {cut['start']:.1f}-{end:.1f}s")
+            result = subprocess.run(
+                [ffmpeg, "-y", "-v", "error",
+                 "-ss", f"{cut['start']:.3f}", "-t", f"{end - cut['start']:.3f}",
+                 "-i", src, *video_args, *audio_args,
+                 "-avoid_negative_ts", "make_zero", seg],
+                capture_output=True, text=True, check=False,
+            )
+            if result.returncode != 0 or not os.path.exists(seg):
+                print(f"  Segment failed, skipping: {result.stderr.strip()}")
+                continue
+            segments.append(seg)
 
-            print(f"\nStitching {len(final_clips)} cuts into {output_path}...")
-            vlog = concatenate_videoclips(final_clips, method="compose")
-            extra = {"preset": preset} if preset else {}
-            try:
-                vlog.write_videofile(
-                    output_path,
-                    codec="libx264",
-                    audio_codec="aac",
-                    bitrate=bitrate,
-                    temp_audiofile=self.workdir.file("render_temp_audio.m4a"),
-                    remove_temp=True,
-                    threads=4,
-                    **extra,
-                )
-            finally:
-                vlog.close()
-            return True
-        finally:
-            for clip in open_sources.values():
-                clip.close()
+        if not segments:
+            print("\nNo clips survived selection.")
+            return False
+
+        print(f"\nStitching {len(segments)} cuts into {output_path}...")
+        list_path = self.workdir.file("concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for seg in segments:
+                f.write(f"file '{seg}'\n")
+        result = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", list_path, "-c", "copy", "-movflags", "+faststart", output_path],
+            capture_output=True, text=True, check=False,
+        )
+        for seg in segments:
+            self.workdir.remove(seg)
+        self.workdir.remove(list_path)
+        if result.returncode != 0:
+            print(f"Concat failed: {result.stderr.strip()}")
+            return False
+        print(f"Render finished in {time.time() - t0:.0f}s.")
+        return True
 
     @staticmethod
     def write_edl(edit_plan, path):

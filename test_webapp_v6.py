@@ -31,25 +31,8 @@ sys.modules["numpy"] = np_stub
 RENDERS = []
 OPENED = []
 
-class FakeClip:
-    duration = 10_000.0
-    def subclipped(self, start, end):
-        return ("sub", start, end)
-    def close(self):
-        pass
-
-class FakeFinal:
-    def write_videofile(self, output_path, **kwargs):
-        RENDERS.append({"output": output_path, **kwargs})
-        with open(output_path, "wb") as f:
-            f.write(b"\x00" * 4096)  # real bytes so /api/media can serve it
-    def close(self):
-        pass
-
 _stub("torch", cuda=types.SimpleNamespace(empty_cache=lambda: None,
                                           is_available=lambda: False))
-_stub("moviepy", VideoFileClip=lambda src: (OPENED.append(src), FakeClip())[1],
-      concatenate_videoclips=lambda clips, method=None: FakeFinal())
 _stub("transformers", Qwen3_5ForConditionalGeneration=object, AutoProcessor=object,
       BitsAndBytesConfig=object)
 _stub("faster_whisper", WhisperModel=None)
@@ -59,6 +42,32 @@ tc.decoders = sys.modules["torchcodec.decoders"]
 
 import betterautoeditor as ae
 import webapp
+
+# ---- fake ffmpeg/ffprobe: record what renders encode ------------------------
+ae.FFMPEG_BIN = "ffmpeg"
+ae.FFPROBE_BIN = "ffprobe"
+ae._NVENC_AVAILABLE = False  # deterministic libx264 args on this box
+
+_CURRENT = {}
+def fake_run(cmd, **kwargs):
+    ok = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd[0] == "ffprobe":
+        ok.stdout = "10000.0\n"
+        return ok
+    if "concat" in cmd:
+        out = cmd[-1]
+        with open(out, "wb") as f:
+            f.write(b"\x00" * 4096)  # real bytes so /api/media can serve it
+        RENDERS.append({"output": out, **_CURRENT})
+        return ok
+    src = cmd[cmd.index("-i") + 1]
+    OPENED.append(src)
+    _CURRENT["bitrate"] = cmd[cmd.index("-b:v") + 1]
+    _CURRENT["preset"] = cmd[cmd.index("-preset") + 1]
+    with open(cmd[-1], "wb") as f:
+        f.write(b"\x00")
+    return ok
+ae.subprocess = types.SimpleNamespace(run=fake_run)
 
 failures = []
 def check(name, cond):
@@ -77,7 +86,6 @@ for stem in ("DJI_0001", "DJI_0002"):
 
 webapp.ROOT = root
 webapp.WORKDIR = ae.WorkDir()
-webapp.faststart_remux = lambda path: None  # no real ffmpeg on this box
 
 # fake library on disk matching the pairs' fingerprint
 pairs = ae.get_video_pairs(project)

@@ -26,30 +26,11 @@ np_stub.integer = int
 np_stub.floating = float
 sys.modules["numpy"] = np_stub
 
-RENDERS = []          # one dict per write_videofile call
-OPENED = []           # source paths opened per render (reset by test)
-
-class FakeClip:
-    duration = 10_000.0
-    def subclipped(self, start, end):
-        return ("sub", start, end)
-    def close(self):
-        pass
-
-def fake_videofileclip(src):
-    OPENED.append(src)
-    return FakeClip()
-
-class FakeFinal:
-    def write_videofile(self, output_path, **kwargs):
-        RENDERS.append({"output": output_path, **kwargs})
-    def close(self):
-        pass
+RENDERS = []          # one dict per finished render (concat call)
+OPENED = []           # source paths encoded per render (reset by test)
 
 _stub("torch", cuda=types.SimpleNamespace(empty_cache=lambda: None,
                                           is_available=lambda: False))
-_stub("moviepy", VideoFileClip=fake_videofileclip,
-      concatenate_videoclips=lambda clips, method=None: FakeFinal())
 _stub("transformers", Qwen3_5ForConditionalGeneration=object, AutoProcessor=object,
       BitsAndBytesConfig=object)
 _stub("faster_whisper", WhisperModel=None)
@@ -58,6 +39,32 @@ _stub("torchcodec.decoders", VideoDecoder=type("VD", (), {"get_frames_at": lambd
 tc.decoders = sys.modules["torchcodec.decoders"]
 
 import betterautoeditor as ae
+
+# ---- fake ffmpeg/ffprobe: record what the render encodes -------------------
+ae.FFMPEG_BIN = "ffmpeg"
+ae.FFPROBE_BIN = "ffprobe"
+ae._NVENC_AVAILABLE = False  # deterministic libx264 args on this box
+
+_CURRENT = {}
+def fake_run(cmd, **kwargs):
+    ok = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd[0] == "ffprobe":
+        ok.stdout = "10000.0\n"
+        return ok
+    if "concat" in cmd:
+        out = cmd[-1]
+        with open(out, "wb") as f:
+            f.write(b"\x00" * 4096)
+        RENDERS.append({"output": out, **_CURRENT})
+        return ok
+    src = cmd[cmd.index("-i") + 1]
+    OPENED.append(src)
+    _CURRENT["bitrate"] = cmd[cmd.index("-b:v") + 1]
+    _CURRENT["preset"] = cmd[cmd.index("-preset") + 1]
+    with open(cmd[-1], "wb") as f:
+        f.write(b"\x00")
+    return ok
+ae.subprocess = types.SimpleNamespace(run=fake_run)
 
 failures = []
 def check(name, cond):
@@ -97,8 +104,8 @@ check("preview uses ultrafast + preview bitrate",
 OPENED.clear(); RENDERS.clear()
 editor.render(plan, "final.mp4")
 check("final opens hi-res sources", OPENED == ["/fake/A.MP4", "/fake/B.MP4"])
-check("final uses 55Mbps and no preset override",
-      RENDERS[-1]["bitrate"] == ae.FINAL_BITRATE and "preset" not in RENDERS[-1])
+check("final uses 55Mbps at quality preset",
+      RENDERS[-1]["bitrate"] == ae.FINAL_BITRATE and RENDERS[-1]["preset"] == "medium")
 
 # ---- 3. render_from_edl on a hand-edited EDL ---------------------------------
 edl_path = os.path.join(tmp, "test_edl.json")
