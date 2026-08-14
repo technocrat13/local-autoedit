@@ -285,7 +285,7 @@ function pickerCandidates(gap, showAll) {
 }
 
 function openPicker(gap) {
-  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, aiStatus: "" };
+  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, roles: {}, aiStatus: "" };
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -306,8 +306,9 @@ function renderPicker() {
     `<div class="picker-head"><strong>Add clip ${where}</strong>` +
     `<button id="picker-close" class="linkish">close</button></div>` +
     `<div class="picker-ai">` +
-    `<input id="picker-query" type="text" placeholder="describe the moment to add, e.g. 'where we order coffee'">` +
-    `<button id="picker-suggest"${candidates.length ? "" : " disabled"}>Find with AI</button>` +
+    `<input id="picker-query" type="text" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
+    `<label class="inline">cuts <input id="picker-cuts" class="num" type="number" value="3" min="1" max="10"></label>` +
+    `<button id="picker-suggest"${candidates.length ? "" : " disabled"}>Compose gap fill</button>` +
     `<span id="picker-ai-status" class="hint">${esc(p.aiStatus)}</span></div>` +
     (candidates.length
       ? `<div class="picker-grid">` + candidates.map((c) => {
@@ -321,7 +322,7 @@ function renderPicker() {
             (chunkInEdit(c) ? ` <span class="badge waiting">in edit</span>` : "") + `</div>` +
             `<div>${esc(c.summary)}</div>` +
             (c.transcript ? `<div class="speech">&ldquo;${esc(c.transcript)}&rdquo;</div>` : "") +
-            (reason ? `<div class="ai-reason">AI: ${esc(reason)}</div>` : "") +
+            (reason ? `<div class="ai-reason">${p.roles[c.library_id] ? esc(p.roles[c.library_id]) + ": " : ""}${esc(reason)}</div>` : "") +
             `</div>` +
             `<div class="pick-actions">` +
             `<button class="pick-play" title="preview">&#9654;</button>` +
@@ -356,18 +357,22 @@ function renderPicker() {
 
 async function runSuggest(candidates) {
   const p = state.picker;
-  const query = $("#picker-query").value.trim();
-  if (!query) return alert("Describe the moment you want to add first.");
-  p.query = query;
+  const brief = $("#picker-query").value.trim();
+  if (!brief) return alert("Give a brief for this gap first.");
+  p.query = brief;
   p.aiStatus = "submitting…";
   renderPicker();
-  $("#picker-query").value = query;
+  $("#picker-query").value = brief;
   try {
     const data = await api("/api/jobs", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         type: "suggest", project: state.project.project,
-        params: { query, candidate_ids: candidates.map((c) => c.library_id) },
+        params: {
+          brief,
+          target_cuts: parseInt($("#picker-cuts").value, 10) || 3,
+          candidate_ids: candidates.map((c) => c.library_id),
+        },
       }),
     });
     pollSuggest(data.job_id);
@@ -388,11 +393,12 @@ function pollSuggest(jobId) {
         clearInterval(timer);
         const picks = (j.result && j.result.picks) || [];
         p.aiStatus = picks.length
-          ? `AI picked ${picks.length} chunk(s) for "${p.query}"`
-          : `AI found nothing matching "${p.query}"`;
+          ? `composed ${picks.length} cut(s) for "${p.query}"`
+          : `nothing matched "${p.query}"`;
         for (const pick of picks) {
           p.checked.add(pick.library_id);
           p.reasons[pick.library_id] = pick.reason;
+          p.roles[pick.library_id] = pick.role;
         }
       } else if (j.status === "error") {
         clearInterval(timer);
@@ -422,8 +428,8 @@ function addPicked(candidates) {
       cut: {
         source_file: pair.hires || "", lrf_file: pair.lrf || "",
         source: c.source, start: c.start, end: c.end,
-        role: "manual", beat: "", summary: c.summary || "",
-        speech: c.transcript || "",
+        role: p.roles[c.library_id] || "manual", beat: "",
+        summary: c.summary || "", speech: c.transcript || "",
       },
     };
   });

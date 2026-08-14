@@ -383,35 +383,56 @@ check("v2 cache migrates to sticky format",
       mlib is not None and len(mlib.chunks) == 1
       and mlib.clip_entries["DJI_0201.MP4"]["lrf_size"] == 128)
 
-# ---- 10. suggest job: AI-assisted add-clip picker --------------------------------
+# ---- 10. suggest job: compose-based gap fill --------------------------------------
 # projectB library ids after churn: contiguous 0..N-1 across remaining clips
 rlib, _ = ae.ChunkLibrary.load(pathsB["library"], pairsB)
 all_ids = [c["library_id"] for c in rlib.chunks]
+window_ids = all_ids[:-1]  # a strict subset, like a real between-cuts gap
 
-ae._llm_text = lambda system, user, max_tokens: json.dumps(
-    {"selections": [{"chunk_id": all_ids[0], "reason": "matches the query"},
-                    {"chunk_id": 999, "reason": "hallucinated id"},
-                    {"chunk_id": all_ids[0], "reason": "duplicate"}]})
+SEEN.clear()
 j = run_job({"type": "suggest", "project": projectB,
-             "params": {"query": "the walking moment", "candidate_ids": all_ids}})
-check("suggest returns validated, deduped picks", j["status"] == "done"
-      and j["result"]["picks"] == [{"library_id": all_ids[0],
-                                    "reason": "matches the query"}])
+             "params": {"brief": "the walking moment", "target_cuts": 3,
+                        "candidate_ids": window_ids}})
+check("gap fill runs the compose pipeline on the brief",
+      j["status"] == "done" and SEEN.get("brief") == "the walking moment")
+check("composer only sees the window's chunks",
+      isinstance(SEEN.get("library"), webapp.LibraryView)
+      and sorted(c["library_id"] for c in SEEN["library"].chunks)
+      == sorted(window_ids))
+picks = j["result"]["picks"] if j["status"] == "done" else []
+check("picks carry composer roles and stay inside the window",
+      len(picks) == 2 and {p["library_id"] for p in picks} <= set(window_ids)
+      and {p["role"] for p in picks} == {"setting", "peak"}
+      and all("reason" in p and "beat" in p for p in picks))
 
-ae._llm_text = lambda system, user, max_tokens: "total garbage, not json at all"
+# composer strikes out -> deterministic fallback fills the gap
+real_compose, real_fallback = ae.StoryComposer.compose, ae.FallbackSelector.select
+ae.StoryComposer.compose = lambda self, library, story, n: []
+ae.FallbackSelector.select = lambda self, library, story, n: [
+    {"chunk": library.chunks[0], "role": "peak", "reason": "fallback"}]
 j = run_job({"type": "suggest", "project": projectB,
-             "params": {"query": "anything", "candidate_ids": all_ids}})
-check("suggest survives garbage LLM output",
-      j["status"] == "done" and j["result"]["picks"] == [])
+             "params": {"brief": "anything", "candidate_ids": window_ids}})
+check("gap fill falls back to deterministic scoring",
+      j["status"] == "done" and len(j["result"]["picks"]) == 1
+      and j["result"]["picks"][0]["reason"] == "fallback")
+
+# nothing matches at all -> clean error
+ae.FallbackSelector.select = lambda self, library, story, n: []
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "anything", "candidate_ids": window_ids}})
+check("gap fill with no matches errors cleanly",
+      j["status"] == "error" and "brief" in j["error"])
+ae.StoryComposer.compose, ae.FallbackSelector.select = real_compose, real_fallback
 
 j = run_job({"type": "suggest", "project": projectB,
-             "params": {"query": "anything", "candidate_ids": []}})
-check("suggest with empty window errors cleanly",
+             "params": {"brief": "anything", "candidate_ids": []}})
+check("gap fill with empty window errors cleanly",
       j["status"] == "error" and "window" in j["error"])
 
 j = run_job({"type": "suggest", "project": projectB,
-             "params": {"query": "", "candidate_ids": all_ids}})
-check("suggest with empty query errors cleanly", j["status"] == "error")
+             "params": {"brief": "", "candidate_ids": window_ids}})
+check("gap fill with empty brief errors cleanly",
+      j["status"] == "error" and "gap" in j["error"])
 
 # manually-added cut (picker output shape) round-trips through /api/edl
 res = client.post("/api/edl", json={

@@ -265,57 +265,39 @@ def job_render(job, kind):
 
 
 def job_suggest(job):
-    """Pick chunks matching a free-text query from a candidate window - used by
-    the EDL editor's add-clip picker to recover moments the first pass missed."""
+    """Gap-fill: run the normal compose pipeline (brief -> story -> composer,
+    with fallback) on just the chunks between two cuts, so the EDL editor can
+    weave a small video into a gap the first pass missed."""
     project = job["project"]
     params = job["params"]
     paths = project_paths(project)
     pairs = engine.get_video_pairs(project)
     library, _ = engine.ChunkLibrary.load(paths["library"], pairs)
     candidate_ids = {int(i) for i in params.get("candidate_ids") or []}
-    candidates = [c for c in library.chunks if c["library_id"] in candidate_ids]
-    if not candidates:
+    chunks = [c for c in library.chunks if c["library_id"] in candidate_ids]
+    if not chunks:
         raise RuntimeError("No analyzed chunks in this window to pick from.")
-    query = (params.get("query") or "").strip()
-    if not query:
-        raise RuntimeError("Describe the moment you want to add.")
-    max_picks = max(1, min(10, int(params.get("max_picks") or 3)))
+    brief = (params.get("brief") or "").strip()
+    if not brief:
+        raise RuntimeError("Describe what should fill this gap.")
+    target_cuts = max(1, min(10, int(params.get("target_cuts") or 3)))
+    view = LibraryView(chunks)
 
     engine.load_model()
-    set_stage(job, f"searching {len(candidates)} chunks")
-    digest = "\n".join(engine.StoryComposer._digest_line(c) for c in candidates)
-    user = (
-        "An editor wants to add a small moment to an existing vlog edit. Their "
-        f'request: "{query}"\n'
-        f"Below are the available shots in chronological order. Pick up to "
-        f"{max_picks} shots that best match the request - fewer is fine, and "
-        "pick none if nothing matches.\n"
-        "Rules:\n"
-        "- Only use id values that appear below.\n"
-        "- Prefer shots whose summary, tags, or speech directly match the request.\n"
-        'Output ONLY a JSON object: {"selections": [list of objects, each with '
-        '"chunk_id" (id number) and "reason" (one short sentence)]}.\n\n'
-        f"SHOTS:\n{digest}"
-    )
-    parsed = engine.parse_json_response(
-        engine._llm_text(engine.StoryComposer.SYSTEM, user, 400))
-    picks = []
-    seen = set()
-    if isinstance(parsed, dict) and isinstance(parsed.get("selections"), list):
-        for item in parsed["selections"]:
-            if not isinstance(item, dict):
-                continue
-            try:
-                library_id = int(item.get("chunk_id"))
-            except (TypeError, ValueError):
-                continue
-            if library_id in candidate_ids and library_id not in seen:
-                seen.add(library_id)
-                picks.append({"library_id": library_id,
-                              "reason": str(item.get("reason") or "")})
-            if len(picks) >= max_picks:
-                break
-    print(f"Suggest: {len(picks)} pick(s) for \"{query}\".")
+    set_stage(job, f"composing gap fill from {len(chunks)} chunks")
+    story = engine.StoryAgent().parse_user_brief(brief)
+    selections = engine.StoryComposer().compose(view, story, target_cuts)
+    if not selections:
+        print("StoryComposer output unusable - falling back to deterministic scoring.")
+        selections = engine.FallbackSelector().select(view, story, target_cuts)
+    if not selections:
+        raise RuntimeError("Nothing matched - try a different brief.")
+
+    selections.sort(key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
+    picks = [{"library_id": s["chunk"]["library_id"], "role": s["role"],
+              "reason": s.get("reason", ""), "beat": s.get("beat", "")}
+             for s in selections[:target_cuts]]
+    print(f"Gap fill: {len(picks)} pick(s) for \"{brief}\".")
     return {"picks": picks}
 
 
