@@ -129,15 +129,7 @@ def run_job(payload):
     jid = webapp.JOB_QUEUE.get()
     job = webapp.JOBS[jid]
     job["status"] = "running"
-    import contextlib
-    try:
-        with contextlib.redirect_stdout(job["log"]):
-            job["result"] = webapp.JOB_HANDLERS[job["type"]](job)
-        job["status"] = "done"
-    except Exception as e:
-        job["log"].write(f"\nERROR: {e}\n")
-        job["status"] = "error"
-        job["error"] = str(e)
+    webapp.execute_job(job)  # the real worker path: timestamps, summary, persist
     return client.get(f"/api/jobs/{job_id}").get_json()
 
 # ---- 1. path safety ----------------------------------------------------------
@@ -447,6 +439,69 @@ with open(webapp.edl_path(projectB, res.get_json()["version"])) as f:
 check("added cut round-trips with exact bounds",
       saved[0]["start"] == 2.5 and saved[0]["end"] == 7.5
       and saved[0]["role"] == "manual" and saved[0]["speech"] == "hello")
+
+# ---- 11. job timestamps, summaries, and persistent history ------------------------
+# section 9 replaced VideoPreprocessor with a bare lambda; compose's preview
+# render still calls the class-level probe_duration
+ae.VideoPreprocessor.probe_duration = lambda src: 100.0
+j = run_job({"type": "compose", "project": projectB,
+             "params": {"brief": "history test", "target_cuts": 5}})
+check("finished job carries timestamps",
+      j["status"] == "done" and j["created"] and j["started"] and j["finished"])
+check("compose job summarized",
+      j["summary"] == f"EDL v{j['result']['version']}, 2 cuts")
+
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "walk", "candidate_ids": window_ids}})
+check("suggest job summarized", j["summary"] == "2 pick(s)")
+
+with open(pathsB["jobs"]) as f:
+    hist = json.load(f)
+check("jobs.json written on finish",
+      hist["schema"] == 1 and hist["jobs"][-1]["type"] == "suggest"
+      and hist["jobs"][-1]["status"] == "done"
+      and 0 < len(hist["jobs"][-1]["log"]) <= webapp.JOBS_LOG_MAX_CHARS)
+check("params summarized into history",
+      hist["jobs"][-2]["params_summary"] == "brief: history test, 5 cuts")
+
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "x", "candidate_ids": []}})
+with open(pathsB["jobs"]) as f:
+    hist = json.load(f)
+check("failed job persisted with error",
+      hist["jobs"][-1]["status"] == "error"
+      and "window" in hist["jobs"][-1]["error"] and hist["jobs"][-1]["finished"])
+
+# merged listing: in-memory jobs first, disk-only entries flagged from_history
+fake = {"id": 9001, "type": "compose", "status": "done", "project": projectB,
+        "params": {"brief": "old run"}, "created": "2026-01-01T10:00:00",
+        "started": "2026-01-01T10:00:00", "finished": "2026-01-01T10:01:00",
+        "summary": "EDL v99, 9 cuts", "error": None, "log": webapp._JobLog()}
+fake["log"].write("old log line")
+webapp.persist_job(fake)
+data = client.get(f"/api/jobs?path={projectB}").get_json()
+mem_entry = next((x for x in data["jobs"] if x["id"] == j["id"]), None)
+disk_entry = next((x for x in data["jobs"] if x["id"] == 9001), None)
+check("job list merges memory and disk", not data["busy"]
+      and mem_entry is not None and "from_history" not in mem_entry
+      and disk_entry is not None and disk_entry.get("from_history")
+      and disk_entry["log"] == "old log line"
+      and disk_entry["summary"] == "EDL v99, 9 cuts")
+
+# history capped at JOBS_HISTORY_MAX entries, newest kept
+for i in range(webapp.JOBS_HISTORY_MAX + 5):
+    entry = dict(fake, id=10000 + i, log=webapp._JobLog())
+    webapp.persist_job(entry)
+with open(pathsB["jobs"]) as f:
+    hist = json.load(f)
+check("history capped, newest kept",
+      len(hist["jobs"]) == webapp.JOBS_HISTORY_MAX
+      and hist["jobs"][-1]["id"] == 10000 + webapp.JOBS_HISTORY_MAX + 4)
+
+check("summarize_result survives malformed results",
+      webapp.summarize_result("compose", None) == ""
+      and webapp.summarize_result("suggest", {}) == ""
+      and webapp.summarize_result("nonsense", {"x": 1}) == "")
 
 print(f"\n{len(failures)} failures")
 sys.exit(1 if failures else 0)

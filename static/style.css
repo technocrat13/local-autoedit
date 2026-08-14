@@ -47,7 +47,7 @@ label { display: block; margin: 8px 0; }
 #folders li { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; }
 #folders .open { font-size: 12px; padding: 2px 8px; }
 
-#main { flex: 1; padding: 16px 20px; overflow-y: auto; }
+#main { flex: 1; padding: 16px 20px 44px; overflow-y: auto; }
 #no-project { color: #9aa3af; margin-top: 40px; text-align: center; }
 #project-header { display: flex; align-items: baseline; gap: 14px; }
 #project-header h2 { margin: 0 0 8px; }
@@ -146,16 +146,72 @@ td button { margin-right: 5px; font-size: 12px; }
 .picker-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
 label.inline { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-size: 12px; }
 
-#job-drawer {
+#status-bar {
   position: fixed;
   left: 0; right: 0; bottom: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  background: #1c2027;
+  border-top: 1px solid #3c4350;
+  font-size: 12px;
+  color: #9aa3af;
+  cursor: pointer;
+  z-index: 5;
+}
+#status-bar.running { color: #e6e9ef; }
+#status-bar.error { color: #ff8a8a; }
+#status-elapsed { margin-left: auto; color: #9aa3af; }
+#status-spinner {
+  width: 12px; height: 12px;
+  border: 2px solid #3c4350;
+  border-top-color: #7dd3fc;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  flex: none;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#job-drawer {
+  position: fixed;
+  left: 0; right: 0; bottom: 28px;
   background: #0f1114;
   border-top: 1px solid #3c4350;
-  max-height: 40vh;
+  height: 40vh;
   display: flex;
   flex-direction: column;
 }
 #job-head { display: flex; justify-content: space-between; padding: 6px 14px; background: #1c2027; }
+#job-body { flex: 1; display: flex; min-height: 0; }
+#job-history {
+  width: 220px;
+  flex: none;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  overflow-y: auto;
+  border-right: 1px solid #3c4350;
+  font-size: 12px;
+}
+#job-history li {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#job-history li:hover { background: #1c2027; }
+#job-history li.active { background: #232936; }
+#job-history .glyph { flex: none; }
+#job-history .glyph.done { color: #7dd87d; }
+#job-history .glyph.error { color: #ff8a8a; }
+#job-history .dur { margin-left: auto; color: #9aa3af; }
+#job-history .jsum { color: #9aa3af; overflow: hidden; text-overflow: ellipsis; }
 #job-log { flex: 1; overflow-y: auto; margin: 0; padding: 8px 14px; font-size: 12px; white-space: pre-wrap; }
 
 #video-modal {

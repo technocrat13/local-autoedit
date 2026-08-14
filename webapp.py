@@ -46,7 +46,12 @@ def project_paths(project):
         "library": os.path.join(ae, "library.json"),
         "state": os.path.join(ae, "state.json"),
         "thumbs": os.path.join(ae, "thumbs"),
+        "jobs": os.path.join(ae, "jobs.json"),
     }
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def edl_path(project, version):
@@ -145,7 +150,8 @@ def submit_job(job_type, project, params):
         JOBS[job_id] = {"id": job_id, "type": job_type, "project": project,
                         "params": params, "status": "queued", "stage": "queued",
                         "log": _JobLog(), "result": None, "error": None,
-                        "progress": None}
+                        "progress": None, "created": now_iso(), "started": None,
+                        "finished": None, "summary": None}
     JOB_QUEUE.put(job_id)
     return job_id
 
@@ -317,20 +323,106 @@ def worker_loop():
             job = JOBS[job_id]
             job["status"] = "running"
             job["stage"] = "starting"
-        log = job["log"]
+        execute_job(job)
+
+
+def execute_job(job):
+    """Run a job to completion, stamp timestamps/summary, persist history."""
+    log = job["log"]
+    with JOBS_LOCK:
+        job["started"] = now_iso()
+    try:
+        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            result = JOB_HANDLERS[job["type"]](job)
+        with JOBS_LOCK:
+            job["status"] = "done"
+            job["stage"] = "done"
+            job["result"] = result
+            job["finished"] = now_iso()
+            job["summary"] = summarize_result(job["type"], result)
+    except Exception as e:  # job errors must never kill the worker
+        log.write(f"\nERROR: {e}\n")
+        with JOBS_LOCK:
+            job["status"] = "error"
+            job["stage"] = "error"
+            job["error"] = str(e)
+            job["finished"] = now_iso()
+    persist_job(job)
+
+
+def summarize_result(job_type, result):
+    """One-line human summary of a finished job; persists into history."""
+    try:
+        if job_type == "analyze":
+            return f"{result['chunks']} chunks in library"
+        if job_type == "compose":
+            return f"EDL v{result['version']}, {result['cut_count']} cuts"
+        if job_type in ("preview", "finalize"):
+            return os.path.basename(result["output"])
+        if job_type == "suggest":
+            return f"{len(result['picks'])} pick(s)"
+    except (TypeError, KeyError):
+        pass
+    return ""
+
+
+def summarize_params(job_type, params):
+    try:
+        if job_type in ("compose", "suggest"):
+            brief = (params.get("brief") or "").strip()
+            if len(brief) > 60:
+                brief = brief[:57] + "..."
+            extra = f", {params['target_cuts']} cuts" if params.get("target_cuts") else ""
+            return f"brief: {brief}{extra}" if brief else ""
+        if job_type in ("preview", "finalize"):
+            return f"version {params.get('version')}"
+    except (TypeError, AttributeError):
+        pass
+    return ""
+
+
+JOBS_HISTORY_SCHEMA = 1
+JOBS_HISTORY_MAX = 50
+JOBS_LOG_MAX_CHARS = 20_000
+HISTORY_LOCK = threading.Lock()
+
+
+def load_job_history(project):
+    path = project_paths(project)["jobs"]
+    if os.path.exists(path):
         try:
-            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-                result = JOB_HANDLERS[job["type"]](job)
-            with JOBS_LOCK:
-                job["status"] = "done"
-                job["stage"] = "done"
-                job["result"] = result
-        except Exception as e:  # job errors must never kill the worker
-            log.write(f"\nERROR: {e}\n")
-            with JOBS_LOCK:
-                job["status"] = "error"
-                job["stage"] = "error"
-                job["error"] = str(e)
+            with open(path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            if history.get("schema") == JOBS_HISTORY_SCHEMA:
+                return history
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"schema": JOBS_HISTORY_SCHEMA, "jobs": []}
+
+
+def persist_job(job):
+    """Append a finished job to the project's jobs.json (best-effort)."""
+    try:
+        with JOBS_LOCK:
+            record = {"id": job["id"], "type": job["type"], "status": job["status"],
+                      "created": job["created"], "started": job["started"],
+                      "finished": job["finished"],
+                      "params_summary": summarize_params(job["type"], job["params"]),
+                      "summary": job["summary"], "error": job["error"],
+                      "log": job["log"].getvalue()[-JOBS_LOG_MAX_CHARS:]}
+            project = job["project"]
+        with HISTORY_LOCK:
+            paths = project_paths(project)
+            os.makedirs(paths["autoedit"], exist_ok=True)
+            history = load_job_history(project)
+            history["jobs"].append(record)
+            history["jobs"] = history["jobs"][-JOBS_HISTORY_MAX:]
+            tmp = paths["jobs"] + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            os.replace(tmp, paths["jobs"])
+    except OSError as e:
+        print(f"Could not persist job history: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -469,16 +561,31 @@ def api_jobs_get(job_id):
         return jsonify({"id": job_id, "type": job["type"], "status": job["status"],
                         "stage": job["stage"], "result": job["result"],
                         "error": job["error"], "progress": job["progress"],
+                        "created": job["created"], "started": job["started"],
+                        "finished": job["finished"], "summary": job["summary"],
                         "log_delta": text[offset:], "log_offset": len(text)})
 
 
 @app.get("/api/jobs")
 def api_jobs_list():
+    path = request.args.get("path")
+    project = safe_path(path) if path else None
     with JOBS_LOCK:
         busy = any(j["status"] in ("queued", "running") for j in JOBS.values())
-        jobs = [{"id": j["id"], "type": j["type"], "status": j["status"],
-                 "stage": j["stage"], "project": j["project"]}
-                for j in sorted(JOBS.values(), key=lambda j: j["id"], reverse=True)[:20]]
+        mem = [{"id": j["id"], "type": j["type"], "status": j["status"],
+                "stage": j["stage"], "project": j["project"],
+                "created": j["created"], "started": j["started"],
+                "finished": j["finished"], "summary": j["summary"],
+                "error": j["error"]}
+               for j in sorted(JOBS.values(), key=lambda j: j["id"], reverse=True)
+               if project is None or j["project"] == project][:20]
+    jobs = mem
+    if project is not None:
+        seen = {(j["id"], j["finished"]) for j in mem}
+        disk = [dict(entry, project=project, from_history=True)
+                for entry in reversed(load_job_history(project)["jobs"])
+                if (entry["id"], entry["finished"]) not in seen]
+        jobs = mem + disk
     return jsonify({"busy": busy, "jobs": jobs})
 
 

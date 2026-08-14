@@ -68,12 +68,20 @@
         <div id="edl-picker" class="hidden"></div>
       </section>
     </div>
+    <div id="status-bar">
+      <span id="status-spinner" class="hidden"></span>
+      <span id="status-text">no job running</span>
+      <span id="status-elapsed"></span>
+    </div>
   </main>
 </div>
 
 <div id="job-drawer" class="hidden">
   <div id="job-head"><span id="job-title"></span><button id="job-close">×</button></div>
-  <pre id="job-log"></pre>
+  <div id="job-body">
+    <ul id="job-history"></ul>
+    <pre id="job-log"></pre>
+  </div>
 </div>
 
 <div id="video-modal" class="hidden">

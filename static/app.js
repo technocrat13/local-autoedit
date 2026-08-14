@@ -10,6 +10,11 @@ const state = {
   picker: null,           // { gap, showAll, checked, reasons, aiStatus }
   pollTimer: null,
   activeJob: null,
+  busy: false,
+  lastJob: null,          // snapshot of the most recently finished job
+  jobHistory: [],         // merged in-memory + on-disk jobs for the open project
+  drawerSelection: "live", // "live" or a history index
+  elapsedTimer: null,
 };
 
 async function api(path, opts) {
@@ -82,6 +87,7 @@ async function openProject(path) {
   showTab("clips");
   renderVersions();
   await renderClips();
+  refreshHistory();
 }
 
 async function renderClips() {
@@ -308,7 +314,9 @@ function renderPicker() {
     `<div class="picker-ai">` +
     `<input id="picker-query" type="text" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
     `<label class="inline">cuts <input id="picker-cuts" class="num" type="number" value="3" min="1" max="10"></label>` +
-    `<button id="picker-suggest"${candidates.length ? "" : " disabled"}>Compose gap fill</button>` +
+    `<button id="picker-suggest" data-empty="${candidates.length ? 0 : 1}"` +
+    `${candidates.length && !state.busy ? "" : " disabled"}` +
+    `${state.busy ? ' title="another job is running"' : ""}>Compose gap fill</button>` +
     `<span id="picker-ai-status" class="hint">${esc(p.aiStatus)}</span></div>` +
     (candidates.length
       ? `<div class="picker-grid">` + candidates.map((c) => {
@@ -363,6 +371,12 @@ async function runSuggest(candidates) {
   p.aiStatus = "submitting…";
   renderPicker();
   $("#picker-query").value = brief;
+  const syncPicker = () => {
+    if (state.picker !== p) return false;
+    renderPicker();
+    if (p.query) $("#picker-query").value = p.query;
+    return true;
+  };
   try {
     const data = await api("/api/jobs", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -375,43 +389,32 @@ async function runSuggest(candidates) {
         },
       }),
     });
-    pollSuggest(data.job_id);
+    watchJob(data.job_id, "suggest", {
+      onUpdate(j) {
+        p.aiStatus = j.stage || j.status;
+        syncPicker();
+      },
+      onDone(j) {
+        if (j.status === "error") {
+          p.aiStatus = "failed: " + j.error;
+        } else {
+          const picks = (j.result && j.result.picks) || [];
+          p.aiStatus = picks.length
+            ? `composed ${picks.length} cut(s) for "${p.query}" - review below`
+            : `nothing matched "${p.query}"`;
+          for (const pick of picks) {
+            p.checked.add(pick.library_id);
+            p.reasons[pick.library_id] = pick.reason;
+            p.roles[pick.library_id] = pick.role;
+          }
+        }
+        syncPicker();
+      },
+    });
   } catch (e) {
     p.aiStatus = "failed: " + e.message;
     renderPicker();
   }
-}
-
-function pollSuggest(jobId) {
-  const p = state.picker;
-  const timer = setInterval(async () => {
-    if (state.picker !== p) return clearInterval(timer);
-    try {
-      const j = await api(`/api/jobs/${jobId}`);
-      p.aiStatus = j.stage || j.status;
-      if (j.status === "done") {
-        clearInterval(timer);
-        const picks = (j.result && j.result.picks) || [];
-        p.aiStatus = picks.length
-          ? `composed ${picks.length} cut(s) for "${p.query}"`
-          : `nothing matched "${p.query}"`;
-        for (const pick of picks) {
-          p.checked.add(pick.library_id);
-          p.reasons[pick.library_id] = pick.reason;
-          p.roles[pick.library_id] = pick.role;
-        }
-      } else if (j.status === "error") {
-        clearInterval(timer);
-        p.aiStatus = "failed: " + j.error;
-      }
-      renderPicker();
-      if (p.query) $("#picker-query").value = p.query;
-    } catch (e) {
-      clearInterval(timer);
-      p.aiStatus = "failed: " + e.message;
-      renderPicker();
-    }
-  }, 1000);
 }
 
 function addPicked(candidates) {
@@ -471,45 +474,196 @@ async function startJob(type, params) {
   }
 }
 
-function watchJob(jobId, type) {
-  state.activeJob = { id: jobId, logOffset: 0 };
-  $("#job-drawer").classList.remove("hidden");
+function watchJob(jobId, type, hooks = {}) {
+  state.activeJob = { id: jobId, type, logOffset: 0, started: Date.now() };
+  state.drawerSelection = "live";
+  if (type !== "suggest") $("#job-drawer").classList.remove("hidden");
   $("#job-title").textContent = `${type} job #${jobId} - queued`;
   $("#job-log").textContent = "";
-  setJobButtons(true);
+  setBusy(true);
+  renderJobHistory();
   clearInterval(state.pollTimer);
   state.pollTimer = setInterval(async () => {
     try {
       const j = await api(`/api/jobs/${jobId}?log_offset=${state.activeJob.logOffset}`);
+      if (j.started) state.activeJob.started = Date.parse(j.started);
       if (j.log_delta) {
-        $("#job-log").textContent += j.log_delta;
-        $("#job-log").scrollTop = $("#job-log").scrollHeight;
+        if (state.drawerSelection === "live") {
+          $("#job-log").textContent += j.log_delta;
+          $("#job-log").scrollTop = $("#job-log").scrollHeight;
+        }
         state.activeJob.logOffset = j.log_offset;
       }
       $("#job-title").textContent = `${j.type} job #${jobId} - ${j.stage}`;
+      updateStatusBar(j);
       if (j.type === "analyze" && j.progress) updateClipStatuses(j.progress);
+      if (hooks.onUpdate) hooks.onUpdate(j);
       if (j.status === "done" || j.status === "error") {
         clearInterval(state.pollTimer);
-        setJobButtons(false);
+        state.lastJob = j;
+        state.activeJob = null;
+        setBusy(false);
+        updateStatusBar(null);
         if (j.status === "error") $("#job-title").textContent += ` - FAILED: ${j.error}`;
-        await refreshProject();
-        if (j.status === "done" && j.result && j.result.version !== undefined
-            && j.type !== "finalize") {
-          showTab("versions");
+        if (hooks.onDone) hooks.onDone(j);
+        await refreshHistory();
+        if (j.type !== "suggest") {
+          await refreshProject();
+          if (j.status === "done" && j.result && j.result.version !== undefined
+              && j.type !== "finalize") {
+            showTab("versions");
+          }
         }
       }
     } catch (e) {
       clearInterval(state.pollTimer);
-      setJobButtons(false);
+      state.activeJob = null;
+      setBusy(false);
+      updateStatusBar(null);
     }
   }, 1000);
 }
 
-function setJobButtons(busy) {
+function setBusy(busy) {
+  state.busy = busy;
   document.querySelectorAll("#btn-analyze, #btn-compose, #versions-table button")
     .forEach((b) => {
       if (["preview", "finalize"].includes(b.dataset.act) || !b.dataset.act) b.disabled = busy;
     });
+  const suggest = $("#picker-suggest");
+  if (suggest) suggest.disabled = busy || suggest.dataset.empty === "1";
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+}
+
+function fmtAgo(iso) {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function jobDuration(j) {
+  if (!j.started || !j.finished) return "";
+  return fmtDuration(Date.parse(j.finished) - Date.parse(j.started));
+}
+
+function updateStatusBar(j) {
+  const bar = $("#status-bar");
+  const spinner = $("#status-spinner");
+  const text = $("#status-text");
+  const elapsed = $("#status-elapsed");
+  if (j && (j.status === "running" || j.status === "queued")) {
+    bar.className = "running";
+    spinner.classList.remove("hidden");
+    text.textContent = `${j.type} #${j.id} — ${j.stage}`;
+    return;
+  }
+  spinner.classList.add("hidden");
+  const last = state.lastJob;
+  if (last) {
+    const ok = last.status === "done";
+    bar.className = ok ? "" : "error";
+    text.textContent = (ok ? "✓" : "✗") + ` ${last.type} #${last.id} ` +
+      (ok ? `finished${last.finished ? " " + fmtAgo(last.finished) : ""}` +
+            (last.summary ? ` — ${last.summary}` : "")
+          : `failed — ${last.error}`);
+    elapsed.textContent = jobDuration(last);
+  } else {
+    bar.className = "";
+    text.textContent = "no job running";
+    elapsed.textContent = "";
+  }
+}
+
+function tickElapsed() {
+  const a = state.activeJob;
+  if (a) {
+    $("#status-elapsed").textContent = fmtDuration(Date.now() - a.started);
+  } else if (state.lastJob && state.lastJob.finished) {
+    updateStatusBar(null); // refresh the "Xm ago" text
+  }
+}
+
+async function refreshHistory() {
+  if (!state.project) return;
+  try {
+    const data = await api(`/api/jobs?path=${encodeURIComponent(state.project.project)}`);
+    state.jobHistory = data.jobs.filter((j) => j.status === "done" || j.status === "error");
+    if (!state.lastJob && state.jobHistory.length) state.lastJob = state.jobHistory[0];
+    renderJobHistory();
+    if (!state.activeJob) updateStatusBar(null);
+  } catch (e) {
+    /* history is best-effort */
+  }
+}
+
+function renderJobHistory() {
+  const ul = $("#job-history");
+  ul.innerHTML = "";
+  if (state.activeJob) {
+    const li = document.createElement("li");
+    li.className = state.drawerSelection === "live" ? "active" : "";
+    li.innerHTML = `<span class="glyph">⟳</span>` +
+      `<span>${esc(state.activeJob.type)} #${state.activeJob.id}</span>` +
+      `<span class="dur">running</span>`;
+    li.onclick = () => { state.drawerSelection = "live"; selectLiveJob(); };
+    ul.appendChild(li);
+  }
+  state.jobHistory.forEach((j, idx) => {
+    const ok = j.status === "done";
+    const li = document.createElement("li");
+    li.className = state.drawerSelection === idx ? "active" : "";
+    li.title = [j.params_summary, j.summary || j.error].filter(Boolean).join("\n");
+    li.innerHTML = `<span class="glyph ${ok ? "done" : "error"}">${ok ? "✓" : "✗"}</span>` +
+      `<span>${esc(j.type)} #${j.id}</span>` +
+      (j.summary ? `<span class="jsum">${esc(j.summary)}</span>` : "") +
+      `<span class="dur">${jobDuration(j)}</span>`;
+    li.onclick = () => selectHistoryJob(idx);
+    ul.appendChild(li);
+  });
+  if (!state.activeJob && !state.jobHistory.length) {
+    ul.innerHTML = `<li class="hint">no jobs yet</li>`;
+  }
+}
+
+function selectLiveJob() {
+  renderJobHistory();
+  const a = state.activeJob;
+  $("#job-log").textContent = "";
+  if (a) {
+    a.logOffset = 0; // next poll re-fetches the full log
+    $("#job-title").textContent = `${a.type} job #${a.id}`;
+  }
+}
+
+async function selectHistoryJob(idx) {
+  const j = state.jobHistory[idx];
+  state.drawerSelection = idx;
+  renderJobHistory();
+  $("#job-title").textContent = `${j.type} job #${j.id} - ${j.status}` +
+    (j.summary ? ` - ${j.summary}` : "") + (j.error ? ` - ${j.error}` : "");
+  if (j.from_history) {
+    $("#job-log").textContent = j.log || "(no log)";
+  } else {
+    try {
+      const full = await api(`/api/jobs/${j.id}`);
+      $("#job-log").textContent = full.log_delta || "(no log)";
+    } catch (e) {
+      $("#job-log").textContent = "(log unavailable: " + e.message + ")";
+    }
+  }
+}
+
+function toggleDrawer() {
+  const drawer = $("#job-drawer");
+  const opening = drawer.classList.contains("hidden");
+  drawer.classList.toggle("hidden");
+  if (opening) refreshHistory();
 }
 
 function updateClipStatuses(progress) {
@@ -576,6 +730,8 @@ $("#btn-compose").onclick = () => startJob("compose", {
 });
 $("#btn-edl-save").onclick = saveEdl;
 $("#job-close").onclick = () => $("#job-drawer").classList.add("hidden");
+$("#status-bar").onclick = toggleDrawer;
+state.elapsedTimer = setInterval(tickElapsed, 1000);
 $("#video-close").onclick = () => {
   const player = $("#player");
   if (segmentWatcher) {
@@ -593,7 +749,12 @@ async function reconnectJobs() {
   try {
     const data = await api("/api/jobs");
     const active = data.jobs.find((j) => j.status === "running" || j.status === "queued");
-    if (!active) return;
+    if (!active) {
+      state.lastJob = data.jobs.find(
+        (j) => j.status === "done" || j.status === "error") || null;
+      updateStatusBar(null);
+      return;
+    }
     if (!state.project) await openProject(active.project);
     watchJob(active.id, active.type);
   } catch (e) {
