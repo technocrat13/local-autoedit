@@ -291,7 +291,8 @@ function pickerCandidates(gap, showAll) {
 }
 
 function openPicker(gap) {
-  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, roles: {}, aiStatus: "" };
+  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, roles: {},
+                   aiStatus: "", query: "", cuts: 3 };
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -312,8 +313,8 @@ function renderPicker() {
     `<div class="picker-head"><strong>Add clip ${where}</strong>` +
     `<button id="picker-close" class="linkish">close</button></div>` +
     `<div class="picker-ai">` +
-    `<input id="picker-query" type="text" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
-    `<label class="inline">cuts <input id="picker-cuts" class="num" type="number" value="3" min="1" max="10"></label>` +
+    `<input id="picker-query" type="text" value="${esc(p.query)}" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
+    `<label class="inline">cuts <input id="picker-cuts" class="num" type="number" value="${p.cuts}" min="1" max="10"></label>` +
     `<button id="picker-suggest" data-empty="${candidates.length ? 0 : 1}"` +
     `${candidates.length && !state.busy ? "" : " disabled"}` +
     `${state.busy ? ' title="another job is running"' : ""}>Compose gap fill</button>` +
@@ -345,6 +346,10 @@ function renderPicker() {
 
   $("#picker-close").onclick = () => { state.picker = null; renderEdl(); };
   $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
+  $("#picker-query").oninput = (e) => { p.query = e.target.value; };
+  $("#picker-cuts").oninput = (e) => {
+    p.cuts = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
+  };
   $("#picker-suggest").onclick = () => runSuggest(candidates);
   $("#picker-add").onclick = () => addPicked(candidates);
   box.querySelectorAll(".pick-card").forEach((card) => {
@@ -365,16 +370,14 @@ function renderPicker() {
 
 async function runSuggest(candidates) {
   const p = state.picker;
-  const brief = $("#picker-query").value.trim();
+  const brief = p.query.trim();
   if (!brief) return alert("Give a brief for this gap first.");
   p.query = brief;
   p.aiStatus = "submitting…";
   renderPicker();
-  $("#picker-query").value = brief;
   const syncPicker = () => {
     if (state.picker !== p) return false;
     renderPicker();
-    if (p.query) $("#picker-query").value = p.query;
     return true;
   };
   try {
@@ -384,14 +387,16 @@ async function runSuggest(candidates) {
         type: "suggest", project: state.project.project,
         params: {
           brief,
-          target_cuts: parseInt($("#picker-cuts").value, 10) || 3,
+          target_cuts: p.cuts,
           candidate_ids: candidates.map((c) => c.library_id),
         },
       }),
     });
     watchJob(data.job_id, "suggest", {
       onUpdate(j) {
-        p.aiStatus = j.stage || j.status;
+        const status = j.stage || j.status;
+        if (status === p.aiStatus) return;
+        p.aiStatus = status;
         syncPicker();
       },
       onDone(j) {
