@@ -388,6 +388,15 @@ sels_short = composer.compose_with_graph(lib, story, graph, target_len=60,
 sels_long = composer.compose_with_graph(lib, story, graph, target_len=600,
                                         margin=3.0)
 check("target_len scales cut count", len(sels_short) < len(sels_long))
+# 600s at ~11s/cut wants ~55 cuts; the library only has 30 chunks, so the
+# top-up must exhaust the whole library instead of stopping at element quotas
+check("top-up approaches long targets", len(sels_long) == len(lib.chunks))
+check("top-up picks are flagged for pruning",
+      any(s["beat"] == "top-up" for s in sels_long))
+check("short target adds no top-up",
+      not any(s["beat"] == "top-up" for s in sels_short))
+srt_long = sorted(sels_long, key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
+check("top-up keeps chronology", sels_long == srt_long)
 
 sels_capped = composer.compose_with_graph(lib, story, graph, max_total=3)
 check("max_total caps and drops anchors", len(sels_capped) <= 3 + 2

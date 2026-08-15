@@ -1446,8 +1446,17 @@ class StoryComposer:
         own chunks. Cut count emerges from coverage (optionally scaled to an
         approximate target length in seconds). Returns [] if the graph is
         unusable so callers can fall back to the legacy compose path."""
-        elements = graph.elements_of_day()
-        if not elements or not library.chunks:
+        if not library.chunks:
+            return []
+        # ---- auto cut count ---------------------------------------------------
+        avg_cut = CHUNK_DURATION + 2 * margin
+        target_total = (max(MIN_AUTO_CUTS // 2, round(target_len / avg_cut))
+                        if target_len else None)
+        # long targets need more coverage units, not just more cuts per unit
+        max_elements = MAX_ELEMENTS if not target_total else \
+            max(MAX_ELEMENTS, min(2 * MAX_ELEMENTS, target_total // 3))
+        elements = graph.elements_of_day(max_elements)
+        if not elements:
             return []
         order = {c["library_id"]: (c["source"], c["start"]) for c in library.chunks}
         # brief matching: wanted elements gain weight, avoided ones fade
@@ -1466,17 +1475,15 @@ class StoryComposer:
         elements = sorted(elements,
                           key=lambda e: order.get(e["chunk_ids"][0], ("", 0)))
 
-        # ---- auto cut count ---------------------------------------------------
-        avg_cut = CHUNK_DURATION + 2 * margin
-        if target_len:
-            total = max(MIN_AUTO_CUTS // 2, round(target_len / avg_cut))
-        else:
-            total = max(MIN_AUTO_CUTS, min(MAX_AUTO_CUTS, 2 * len(elements)))
+        total = target_total or max(MIN_AUTO_CUTS,
+                                    min(MAX_AUTO_CUTS, 2 * len(elements)))
         if max_total:
             total = min(total, max_total)
         weights = [len(e["chunk_ids"]) * brief_bias(e) for e in elements]
         wsum = sum(weights) or 1
-        quotas = [max(1, min(4, round(total * w / wsum))) for w in weights]
+        # per-element cap scales with the target so long videos are reachable
+        quota_cap = max(4, -(-total // len(elements)) + 1)
+        quotas = [max(1, min(quota_cap, round(total * w / wsum))) for w in weights]
         print(f"\nStoryComposer: weaving {len(elements)} elements of the day "
               f"(~{sum(quotas)} cuts"
               + (f", targeting ~{target_len:.0f}s" if target_len else ", auto")
@@ -1492,7 +1499,8 @@ class StoryComposer:
             if not chunks:
                 continue
             ranked = sorted(chunks, key=self._prefilter_heuristic, reverse=True)
-            shortlist = sorted(ranked[:15], key=lambda c: c["library_id"])
+            shortlist = sorted(ranked[:max(15, 3 * quota)],
+                               key=lambda c: c["library_id"])
             beat = {"name": el["name"],
                     "narrative": f"the day's {el['type']}: {el['name']}",
                     "target_shots": quota}
@@ -1517,6 +1525,23 @@ class StoryComposer:
             return []
         if max_total is not None:
             selections = selections[:max_total]
+        # top-up: element quotas often under-deliver (LLM returns fewer picks
+        # than asked); when a target length was given, fill the shortfall with
+        # the strongest unused chunks, spread across the day
+        if target_len and max_total is None and len(selections) < total:
+            spare = sorted((c for c in library.chunks
+                            if c["library_id"] not in seen),
+                           key=self._prefilter_heuristic, reverse=True)
+            fills = sorted(spare[:total - len(selections)],
+                           key=lambda c: order[c["library_id"]])
+            for c in fills:
+                seen.add(c["library_id"])
+                selections.append({"chunk": c, "role": "buildup",
+                                   "reason": "length top-up (heuristic pick)",
+                                   "beat": "top-up"})
+            if fills:
+                print(f"  topped up with {len(fills)} heuristic pick(s) to "
+                      f"approach the target length.")
         # anchor the day: guarantee the chronological open and close
         first = min(library.chunks, key=lambda c: order[c["library_id"]])
         last = max(library.chunks, key=lambda c: order[c["library_id"]])
@@ -1526,8 +1551,12 @@ class StoryComposer:
                 selections.append({"chunk": anchor, "role": role,
                                    "reason": "anchors the day", "beat": role})
         selections.sort(key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
+        est = len(selections) * avg_cut
         print(f"\nStoryComposer: {len(selections)} cuts covering "
-              f"{len(elements)} elements of the day.")
+              f"{len(elements)} elements of the day "
+              f"(~{est / 60:.1f} min estimated"
+              + (f" of ~{target_len / 60:.1f} min target" if target_len else "")
+              + ").")
         return selections
 
     def compose(self, library, story, target_cuts):
