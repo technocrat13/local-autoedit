@@ -97,6 +97,16 @@ TRANSCRIPT_DIGEST_CHARS = 200  # cap transcript length inside the composer diges
 
 LIBRARY_SCHEMA = 3  # v3 stores chunks per clip fingerprint (sticky analysis)
 
+# Knowledge graph: one LLM pass per clip extracts entities (people, places,
+# activities, objects, moods, narrative threads); cached per clip with the same
+# lrf_size fingerprint as the library, so it stays in sync and resumes.
+KG_SCHEMA = 1
+KG_MAX_TOKENS = 700
+ELEMENT_MAX_TOKENS = 500
+MAX_ELEMENTS = 12        # coverage units the graph composer weaves together
+MIN_AUTO_CUTS = 8
+MAX_AUTO_CUTS = 30
+
 # Qwen3.5's hybrid Gated DeltaNet + Attention architecture has open bitsandbytes
 # compatibility reports as of mid-2026 (load failures / bad output on the 27B
 # checkpoint; no official 4-bit checkpoints from the Qwen team yet). If loading
@@ -473,6 +483,273 @@ class ChunkLibrary:
         print(f"Library cache hit: {path} ({len(lib.chunks)} chunks) "
               "- skipping video analysis.")
         return lib
+
+
+# ----------------------------------------------------------------------------
+# Knowledge graph - entities per clip (LLM pass), derived edges, coverage units
+# ----------------------------------------------------------------------------
+KG_ENTITY_TYPES = ("person", "place", "activity", "object", "mood", "thread")
+# priority when choosing the day's coverage units (threads/story first)
+KG_TYPE_PRIORITY = {"thread": 0, "place": 1, "activity": 2,
+                    "person": 3, "object": 4, "mood": 5}
+
+
+def kg_normalize(name):
+    return " ".join(str(name).lower().split())
+
+
+class GraphExtractor:
+    """One bounded LLM call per clip: chunk digests in, entities out."""
+
+    SYSTEM = (
+        "You are an archivist building a knowledge graph of one day of vlog "
+        "footage. You only output raw JSON objects. Never talk to the user, "
+        "never use markdown."
+    )
+
+    def extract_clip(self, chunks, vocabulary):
+        """chunks: this clip's chunks in order. vocabulary: {type: [names]} of
+        entities already known from other clips. Returns validated entity list
+        with clip-local chunk_ids."""
+        if not chunks:
+            return []
+        lines = [f"id={i} " + StoryComposer._digest_line(c).split("] ", 1)[-1]
+                 for i, c in enumerate(chunks)]
+        known = "\n".join(f"{t}: {', '.join(names)}"
+                          for t, names in vocabulary.items() if names) or "none yet"
+        user = (
+            "Below are the analyzed shots of ONE video clip, in order. Extract "
+            "the entities this clip shows so the day's knowledge graph can be "
+            "assembled across clips.\n"
+            "Rules:\n"
+            f"- Entity types: {', '.join(KG_ENTITY_TYPES)}. A 'thread' is an "
+            "ongoing storyline or recurring situation (e.g. 'finding the lost "
+            "drone').\n"
+            "- Reuse the EXACT name of a known entity when this clip shows the "
+            "same person/place/thing; only invent a new name for genuinely new "
+            "entities.\n"
+            "- Names are short lowercase phrases (1-4 words). List every shot id "
+            "where the entity appears.\n"
+            'Output ONLY a JSON object: {"entities": [list of objects, each with '
+            '"type", "name", and "chunk_ids" (list of id numbers from below)]}.\n\n'
+            f"KNOWN ENTITIES (reuse these exact names when they match):\n{known}\n\n"
+            f"SHOTS:\n" + "\n".join(lines)
+        )
+        try:
+            parsed = parse_json_response(_llm_text(self.SYSTEM, user, KG_MAX_TOKENS))
+        except Exception as e:
+            print(f"  graph extraction call failed: {e}")
+            return []
+        entities = []
+        seen = set()
+        if isinstance(parsed, dict) and isinstance(parsed.get("entities"), list):
+            for item in parsed["entities"]:
+                if not isinstance(item, dict):
+                    continue
+                etype = str(item.get("type", "")).strip().lower()
+                name = kg_normalize(item.get("name", ""))
+                if etype not in KG_ENTITY_TYPES or not name:
+                    continue
+                ids = []
+                for cid in item.get("chunk_ids") or []:
+                    try:
+                        cid = int(cid)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= cid < len(chunks):
+                        ids.append(cid)
+                key = (etype, name)
+                if not ids or key in seen:
+                    continue
+                seen.add(key)
+                entities.append({"type": etype, "name": name,
+                                 "chunk_ids": sorted(set(ids))})
+        return entities
+
+
+class KnowledgeGraphStore:
+    """Persistence twin of ChunkLibrary: per-clip entity entries keyed by the
+    same lrf_size fingerprint, so graph knowledge is sticky and resumes."""
+
+    def __init__(self):
+        self.clip_entries = {}  # source -> {"lrf_name", "lrf_size", "entities"}
+
+    def commit_clip(self, pair, entities):
+        source = os.path.basename(pair["hires"])
+        self.clip_entries[source] = {
+            "lrf_name": os.path.basename(pair["lrf"]),
+            "lrf_size": ChunkLibrary.clip_fingerprint(pair),
+            "entities": entities,
+        }
+
+    def is_current(self, pair):
+        entry = self.clip_entries.get(os.path.basename(pair["hires"]))
+        return bool(entry) and entry.get("lrf_size") == ChunkLibrary.clip_fingerprint(pair)
+
+    def vocabulary(self):
+        """{type: [names]} of everything known so far, for prompt reuse."""
+        vocab = {t: [] for t in KG_ENTITY_TYPES}
+        seen = set()
+        for entry in self.clip_entries.values():
+            for ent in entry["entities"]:
+                key = (ent["type"], ent["name"])
+                if key not in seen:
+                    seen.add(key)
+                    vocab[ent["type"]].append(ent["name"])
+        return vocab
+
+    def save(self, path):
+        payload = {"schema": KG_SCHEMA, "analysis_fps": ANALYSIS_FPS,
+                   "chunk_duration": CHUNK_DURATION, "clips": self.clip_entries}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=_json_default)
+        total = sum(len(e["entities"]) for e in self.clip_entries.values())
+        print(f"Knowledge graph saved to {path} "
+              f"({len(self.clip_entries)} clips, {total} entities)")
+
+    @classmethod
+    def load(cls, path, pairs):
+        """(store, status) like ChunkLibrary.load: each source is 'analyzed' |
+        'changed' | 'new' against the current fingerprints."""
+        store = cls()
+        payload = None
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception as e:
+                print(f"Could not read knowledge graph cache {path}: {e}")
+        if payload and (payload.get("schema") != KG_SCHEMA
+                        or payload.get("analysis_fps") != ANALYSIS_FPS
+                        or payload.get("chunk_duration") != CHUNK_DURATION):
+            print("Knowledge graph cache ignored: settings or schema changed.")
+            payload = None
+        if payload:
+            store.clip_entries = payload.get("clips", {})
+        status = {}
+        for pair in pairs:
+            source = os.path.basename(pair["hires"])
+            entry = store.clip_entries.get(source)
+            if entry is None:
+                status[source] = "new"
+            elif entry.get("lrf_size") != ChunkLibrary.clip_fingerprint(pair):
+                status[source] = "changed"
+            else:
+                status[source] = "analyzed"
+        return store, status
+
+
+class KnowledgeGraph:
+    """The assembled day: entity nodes merged across clips (by type+name),
+    chunk references resolved to library_ids, derived edges computed on build.
+    Nothing here is persisted - it is rebuilt from the store + library, so it
+    can never drift out of sync."""
+
+    def __init__(self):
+        self.entities = {}   # key "type:name" -> {key, type, name, chunk_ids}
+        self.co_occurs = {}  # frozenset({key_a, key_b}) -> weight
+
+    @classmethod
+    def build(cls, store, library):
+        graph = cls()
+        by_clip = {}
+        for chunk in library.chunks:
+            by_clip.setdefault(chunk["source"], []).append(chunk)
+        for source, entry in store.clip_entries.items():
+            clip_chunks = by_clip.get(source)
+            if not clip_chunks:
+                continue  # clip removed or not in the active library
+            for ent in entry["entities"]:
+                lids = [clip_chunks[i]["library_id"] for i in ent["chunk_ids"]
+                        if 0 <= i < len(clip_chunks)]
+                if not lids:
+                    continue
+                key = f"{ent['type']}:{ent['name']}"
+                node = graph.entities.setdefault(
+                    key, {"key": key, "type": ent["type"], "name": ent["name"],
+                          "chunk_ids": []})
+                node["chunk_ids"].extend(lids)
+        order = {c["library_id"]: (c["source"], c["start"])
+                 for c in library.chunks}
+        for node in graph.entities.values():
+            node["chunk_ids"] = sorted(set(node["chunk_ids"]),
+                                       key=lambda i: order[i])
+        # co-occurrence: entities sharing a chunk
+        by_chunk = {}
+        for node in graph.entities.values():
+            for lid in node["chunk_ids"]:
+                by_chunk.setdefault(lid, []).append(node["key"])
+        for keys in by_chunk.values():
+            for i, a in enumerate(keys):
+                for b in keys[i + 1:]:
+                    pair = frozenset((a, b))
+                    graph.co_occurs[pair] = graph.co_occurs.get(pair, 0) + 1
+        return graph
+
+    def elements_of_day(self, max_elements=MAX_ELEMENTS):
+        """The day's coverage units: the most substantial entities, story
+        threads first, each with its chunks in chronological order."""
+        nodes = sorted(
+            self.entities.values(),
+            key=lambda n: (KG_TYPE_PRIORITY[n["type"]], -len(n["chunk_ids"])))
+        picked, covered = [], set()
+        for node in nodes:
+            if len(picked) >= max_elements:
+                break
+            fresh = [i for i in node["chunk_ids"] if i not in covered]
+            # an element must add real coverage, not restate another element
+            if len(fresh) < max(1, len(node["chunk_ids"]) // 3):
+                continue
+            picked.append(node)
+            covered.update(node["chunk_ids"])
+        return picked
+
+    def chunks_for_element(self, key):
+        node = self.entities.get(key)
+        return list(node["chunk_ids"]) if node else []
+
+    def neighbors(self, key):
+        out = []
+        for pair, weight in self.co_occurs.items():
+            if key in pair:
+                (other,) = pair - {key}
+                out.append((other, weight))
+        out.sort(key=lambda x: -x[1])
+        return out
+
+    def subgraph(self, candidate_ids):
+        """The graph restricted to a window of chunks (gap fill)."""
+        allowed = set(candidate_ids)
+        sub = KnowledgeGraph()
+        for key, node in self.entities.items():
+            kept = [i for i in node["chunk_ids"] if i in allowed]
+            if kept:
+                sub.entities[key] = dict(node, chunk_ids=kept)
+        for pair, weight in self.co_occurs.items():
+            if all(k in sub.entities for k in pair):
+                sub.co_occurs[pair] = weight
+        return sub
+
+    def to_json(self, library):
+        """Explorer payload: nodes/edges plus chunk refs for the side panel."""
+        chunk_meta = {
+            c["library_id"]: {"library_id": c["library_id"], "source": c["source"],
+                              "start": c["start"], "end": c["end"],
+                              "summary": c["one_line_summary"],
+                              "interest": c.get("interest_score", 0)}
+            for c in library.chunks}
+        nodes = []
+        for node in sorted(self.entities.values(), key=lambda n: n["key"]):
+            nodes.append({"id": node["key"], "type": node["type"],
+                          "name": node["name"],
+                          "chunk_count": len(node["chunk_ids"]),
+                          "chunks": [chunk_meta[i] for i in node["chunk_ids"]
+                                     if i in chunk_meta]})
+        edges = [{"a": min(pair), "b": max(pair), "weight": weight}
+                 for pair, weight in self.co_occurs.items()]
+        edges.sort(key=lambda e: (e["a"], e["b"]))
+        element_keys = [n["key"] for n in self.elements_of_day()]
+        return {"nodes": nodes, "edges": edges, "elements": element_keys}
 
 
 # ----------------------------------------------------------------------------
@@ -951,6 +1228,97 @@ class StoryComposer:
             picks.sort(key=lambda p: p["chunk"]["library_id"])
         return picks[:beat["target_shots"] + 2]
 
+    def compose_with_graph(self, library, story, graph, target_len=None,
+                           margin=3.0, max_total=None):
+        """Coverage-driven composition: the knowledge graph's elements of the
+        day are the beats; each element gets a small bounded LLM call over its
+        own chunks. Cut count emerges from coverage (optionally scaled to an
+        approximate target length in seconds). Returns [] if the graph is
+        unusable so callers can fall back to the legacy compose path."""
+        elements = graph.elements_of_day()
+        if not elements or not library.chunks:
+            return []
+        order = {c["library_id"]: (c["source"], c["start"]) for c in library.chunks}
+        # brief matching: wanted elements gain weight, avoided ones fade
+        wanted = [kg_normalize(w) for w in
+                  (story.get("themes") or []) + (story.get("must_capture") or [])]
+        avoided = [kg_normalize(a) for a in story.get("avoid") or []]
+
+        def brief_bias(el):
+            name = el["name"]
+            if any(a and (a in name or name in a) for a in avoided):
+                return 0.3
+            if any(w and (w in name or name in w) for w in wanted):
+                return 2.0
+            return 1.0
+
+        elements = sorted(elements,
+                          key=lambda e: order.get(e["chunk_ids"][0], ("", 0)))
+
+        # ---- auto cut count ---------------------------------------------------
+        avg_cut = CHUNK_DURATION + 2 * margin
+        if target_len:
+            total = max(MIN_AUTO_CUTS // 2, round(target_len / avg_cut))
+        else:
+            total = max(MIN_AUTO_CUTS, min(MAX_AUTO_CUTS, 2 * len(elements)))
+        if max_total:
+            total = min(total, max_total)
+        weights = [len(e["chunk_ids"]) * brief_bias(e) for e in elements]
+        wsum = sum(weights) or 1
+        quotas = [max(1, min(4, round(total * w / wsum))) for w in weights]
+        print(f"\nStoryComposer: weaving {len(elements)} elements of the day "
+              f"(~{sum(quotas)} cuts"
+              + (f", targeting ~{target_len:.0f}s" if target_len else ", auto")
+              + ")...")
+        for el, q in zip(elements, quotas):
+            print(f"  [{el['type']:>8}] {el['name']} "
+                  f"({len(el['chunk_ids'])} chunks, ~{q} cuts)")
+
+        by_id = {c["library_id"]: c for c in library.chunks}
+        selections, seen, prior_lines = [], set(), []
+        for el, quota in zip(elements, quotas):
+            chunks = [by_id[i] for i in el["chunk_ids"] if i in by_id]
+            if not chunks:
+                continue
+            ranked = sorted(chunks, key=self._prefilter_heuristic, reverse=True)
+            shortlist = sorted(ranked[:15], key=lambda c: c["library_id"])
+            beat = {"name": el["name"],
+                    "narrative": f"the day's {el['type']}: {el['name']}",
+                    "target_shots": quota}
+            picks = self._select_for_beat(beat, shortlist, story,
+                                          "\n".join(prior_lines))
+            for pick in picks[:quota + 1]:
+                c = pick["chunk"]
+                if c["library_id"] in seen:
+                    continue
+                seen.add(c["library_id"])
+                pick["beat"] = el["name"]
+                selections.append(pick)
+                print(f"  [{pick['role']:>10}] {c['source']} "
+                      f"{c['start']:.0f}-{c['end']:.0f}s: {pick['reason']}")
+            el_picks = [p for p in selections if p.get("beat") == el["name"]]
+            if el_picks:
+                moments = "; ".join(
+                    p["chunk"]["one_line_summary"][:60] for p in el_picks[:3])
+                prior_lines.append(f"{el['name']}: {moments}")
+
+        if not selections:
+            return []
+        if max_total is not None:
+            selections = selections[:max_total]
+        # anchor the day: guarantee the chronological open and close
+        first = min(library.chunks, key=lambda c: order[c["library_id"]])
+        last = max(library.chunks, key=lambda c: order[c["library_id"]])
+        for anchor, role in ((first, "setting"), (last, "outro")):
+            if anchor["library_id"] not in seen and (max_total is None):
+                seen.add(anchor["library_id"])
+                selections.append({"chunk": anchor, "role": role,
+                                   "reason": "anchors the day", "beat": role})
+        selections.sort(key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
+        print(f"\nStoryComposer: {len(selections)} cuts covering "
+              f"{len(elements)} elements of the day.")
+        return selections
+
     def compose(self, library, story, target_cuts):
         print(f"\nStoryComposer: outlining the day from {len(library.chunks)} chunks...")
         outline = self._compose_outline(library, story, target_cuts)
@@ -1384,6 +1752,27 @@ def analyze_clip(pair, preprocessor, analyzer, transcriber, library, workdir, ma
         torch.cuda.empty_cache()
 
 
+def sync_knowledge_graph(store, kg_path, library, pairs):
+    """Extract entities for every clip whose KG entry is missing or stale,
+    from the already-cached chunks (no video re-analysis). Saves after each
+    clip so an interrupted run resumes."""
+    by_clip = {}
+    for chunk in library.chunks:
+        by_clip.setdefault(chunk["source"], []).append(chunk)
+    extractor = None
+    for pair in pairs:
+        source = os.path.basename(pair["hires"])
+        clip_chunks = by_clip.get(source)
+        if not clip_chunks or store.is_current(pair):
+            continue
+        if extractor is None:
+            extractor = GraphExtractor()
+        entities = extractor.extract_clip(clip_chunks, store.vocabulary())
+        print(f"Knowledge graph: {source} -> {len(entities)} entities")
+        store.commit_clip(pair, entities)
+        store.save(kg_path)
+
+
 def run_pipeline(args):
     output_stem = os.path.splitext(args.output)[0]
     edl_path = output_stem + "_edl.json"
@@ -1403,6 +1792,7 @@ def run_pipeline(args):
 
     workdir = WorkDir()
     library_path = output_stem + "_library.json"
+    kg_path = output_stem + "_kg.json"
 
     library = None
     if not args.reanalyze:
@@ -1432,17 +1822,30 @@ def run_pipeline(args):
             print("\nNo analyzable chunks found in the footage.")
             return
 
+    kg_store, _ = KnowledgeGraphStore.load(kg_path, pairs)
+    sync_knowledge_graph(kg_store, kg_path, library, pairs)
+    graph = KnowledgeGraph.build(kg_store, library)
+
     durations = {c["source"]: c["clip_duration"] for c in library.chunks}
     lrf_by_source = {os.path.basename(p["hires"]): p["lrf"] for p in pairs}
     editor = FinalEditor(workdir)
     preview_kwargs = {"source_key": "lrf_file", "preset": "ultrafast",
                       "bitrate": PREVIEW_BITRATE}
 
-    def compose_and_preview(story, target_cuts):
-        selections = StoryComposer().compose(library, story, target_cuts)
+    def compose_and_preview(story, target_len=None, target_cuts=None):
+        composer = StoryComposer()
+        selections = []
+        if target_cuts is None and graph.entities:
+            selections = composer.compose_with_graph(
+                library, story, graph, target_len=target_len, margin=args.margin)
         if not selections:
-            print("StoryComposer output unusable - falling back to deterministic scoring.")
-            selections = FallbackSelector().select(library, story, target_cuts)
+            cuts = target_cuts or args.target_cuts
+            if target_cuts is None and graph.entities:
+                print("Graph composition unusable - trying the legacy composer.")
+            selections = composer.compose(library, story, cuts)
+            if not selections:
+                print("StoryComposer output unusable - falling back to deterministic scoring.")
+                selections = FallbackSelector().select(library, story, cuts)
         if not selections:
             print("\nNo clips chosen. Try a different brief or --reanalyze.")
             return False
@@ -1455,19 +1858,21 @@ def run_pipeline(args):
         return False
 
     story = StoryAgent().parse_user_brief(args.brief)
-    compose_and_preview(story, args.target_cuts)
+    target_len = args.target_len * 60 if args.target_len else None
+    compose_and_preview(story, target_len=target_len)
 
     if not sys.stdin.isatty():
         print(f"\nPreview + EDL written. Run with --finalize to render the "
               f"hi-res version from {edl_path}.")
         return
 
-    target_cuts = args.target_cuts
+    target_cuts = None
     print(
         "\nIterate on the preview:\n"
         "  final      render the hi-res vlog from the EDL on disk and exit\n"
         "  preview    re-render the LRF preview from the EDL on disk\n"
-        "  cuts N     change target cut count and re-compose\n"
+        "  length N   target roughly N minutes and re-compose (0 = auto)\n"
+        "  cuts N     legacy: fixed cut count instead of graph coverage\n"
         "  quit / q   exit without the hi-res render\n"
         "  <text>     anything else is a new brief - re-compose + preview\n"
         f"(you can also hand-edit {edl_path} between commands)"
@@ -1490,16 +1895,26 @@ def run_pipeline(args):
         if lowered == "preview":
             render_from_edl(edl_path, preview_path, workdir, **preview_kwargs)
             continue
+        if lowered.startswith("length"):
+            try:
+                minutes = float(cmd.split()[1])
+            except (IndexError, ValueError):
+                print("Usage: length N (approximate minutes, e.g. length 5; 0 = auto)")
+                continue
+            target_len = minutes * 60 if minutes > 0 else None
+            target_cuts = None
+            compose_and_preview(story, target_len=target_len)
+            continue
         if lowered.startswith("cuts"):
             try:
                 target_cuts = int(cmd.split()[1])
             except (IndexError, ValueError):
                 print("Usage: cuts N (e.g. cuts 12)")
                 continue
-            compose_and_preview(story, target_cuts)
+            compose_and_preview(story, target_cuts=target_cuts)
             continue
         story = StoryAgent().parse_user_brief(cmd)
-        compose_and_preview(story, target_cuts)
+        compose_and_preview(story, target_len=target_len, target_cuts=target_cuts)
 
 
 def parse_args():
@@ -1514,8 +1929,12 @@ def parse_args():
                         help="Debug cap on chunks per clip (default: process everything).")
     parser.add_argument("--margin", type=float, default=3.0,
                         help="Safety margin seconds added before/after each cut (clamped 2-5).")
+    parser.add_argument("--target-len", type=float, default=None,
+                        help="Approximate target video length in minutes "
+                             "(default: auto from knowledge-graph coverage).")
     parser.add_argument("--target-cuts", type=int, default=15,
-                        help="How many story moments the composer should aim for.")
+                        help="Legacy fixed cut count, used only when the "
+                             "knowledge graph is unavailable.")
     parser.add_argument("--reanalyze", action="store_true",
                         help="Ignore the cached chunk library and redo the vision pass.")
     parser.add_argument("--finalize", action="store_true",

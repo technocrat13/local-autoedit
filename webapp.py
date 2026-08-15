@@ -47,6 +47,7 @@ def project_paths(project):
         "state": os.path.join(ae, "state.json"),
         "thumbs": os.path.join(ae, "thumbs"),
         "jobs": os.path.join(ae, "jobs.json"),
+        "kg": os.path.join(ae, "kg.json"),
     }
 
 
@@ -175,6 +176,7 @@ def job_analyze(job):
     engine.load_model()
     os.makedirs(paths["autoedit"], exist_ok=True)
     library, status = engine.ChunkLibrary.load(paths["library"], pairs)
+    kg_store, _ = engine.KnowledgeGraphStore.load(paths["kg"], pairs)
     preprocessor = engine.VideoPreprocessor(WORKDIR)
     analyzer = engine.ChunkAnalyzer()
     transcriber = engine.SpeechTranscriber()
@@ -193,13 +195,21 @@ def job_analyze(job):
         done = sorted(done + [source])
         # Incremental checkpoint: a stopped job resumes from the next clip.
         library.save(paths["library"])
+        set_stage(job, f"graphing {source} ({i + 1}/{len(pairs)})")
+        # Extracts this clip's entities; also backfills any earlier clip
+        # analyzed before the knowledge graph existed.
+        engine.sync_knowledge_graph(kg_store, paths["kg"], library, pairs)
     with JOBS_LOCK:
         job["progress"] = {"done": done, "current": None,
                            "total": len(pairs), "chunks": len(library.chunks)}
     transcriber.unload()
     if not library.chunks:
         raise RuntimeError("No analyzable chunks found in the footage.")
-    return {"chunks": len(library.chunks)}
+    # All clips may have been analyzed already - still bring the graph current.
+    set_stage(job, "syncing knowledge graph")
+    engine.sync_knowledge_graph(kg_store, paths["kg"], library, pairs)
+    return {"chunks": len(library.chunks),
+            "kg_clips": len(kg_store.clip_entries)}
 
 
 def job_compose(job):
@@ -227,16 +237,33 @@ def job_compose(job):
             print(f"Note: composing from analyzed clips only - "
                   f"{len(pending)} clip(s) still pending analysis.")
     brief = params.get("brief") or engine.DEFAULT_BRIEF
-    target_cuts = int(params.get("target_cuts") or 15)
+    target_len = params.get("target_len")
+    target_len = float(target_len) if target_len else None
+    target_cuts = params.get("target_cuts")
+    target_cuts = int(target_cuts) if target_cuts else None
     margin = max(2.0, min(5.0, float(params.get("margin") or 3.0)))
 
     engine.load_model()
     set_stage(job, f"composing story from {len(library.chunks)} chunks")
     story = engine.StoryAgent().parse_user_brief(brief)
-    selections = engine.StoryComposer().compose(library, story, target_cuts)
+    composer = engine.StoryComposer()
+    selections = []
+    if target_cuts is None:
+        kg_store, _ = engine.KnowledgeGraphStore.load(paths["kg"], pairs)
+        graph = engine.KnowledgeGraph.build(kg_store, library)
+        if graph.entities:
+            selections = composer.compose_with_graph(
+                library, story, graph, target_len=target_len, margin=margin)
+            if not selections:
+                print("Graph composition unusable - trying the legacy composer.")
+        else:
+            print("No knowledge graph yet - using the legacy composer "
+                  "(re-run Analyze to build one).")
+    if not selections:
+        selections = composer.compose(library, story, target_cuts or 15)
     if not selections:
         print("StoryComposer output unusable - falling back to deterministic scoring.")
-        selections = engine.FallbackSelector().select(library, story, target_cuts)
+        selections = engine.FallbackSelector().select(library, story, target_cuts or 15)
     if not selections:
         raise RuntimeError("No clips chosen - try a different brief.")
 
@@ -248,6 +275,7 @@ def job_compose(job):
 
     version = add_version(project, "compose", {
         "parent": None, "brief": brief, "target_cuts": target_cuts,
+        "target_len": target_len,
         "margin": margin, "sources": sources, "cut_count": len(edit_plan)})
     engine.FinalEditor.write_edl(edit_plan, edl_path(project, version))
 
@@ -286,23 +314,34 @@ def job_suggest(job):
     brief = (params.get("brief") or "").strip()
     if not brief:
         raise RuntimeError("Describe what should fill this gap.")
-    target_cuts = max(1, min(10, int(params.get("target_cuts") or 3)))
+    target_cuts = params.get("target_cuts")
+    target_cuts = max(1, min(10, int(target_cuts))) if target_cuts else None
     view = LibraryView(chunks)
 
     engine.load_model()
     set_stage(job, f"composing gap fill from {len(chunks)} chunks")
     story = engine.StoryAgent().parse_user_brief(brief)
-    selections = engine.StoryComposer().compose(view, story, target_cuts)
+    composer = engine.StoryComposer()
+    selections = []
+    kg_store, _ = engine.KnowledgeGraphStore.load(paths["kg"], pairs)
+    subgraph = engine.KnowledgeGraph.build(kg_store, library).subgraph(candidate_ids)
+    if subgraph.entities:
+        selections = composer.compose_with_graph(
+            view, story, subgraph, max_total=target_cuts or 10)
+    if not selections:
+        if subgraph.entities:
+            print("Graph gap fill unusable - trying the legacy composer.")
+        selections = composer.compose(view, story, target_cuts or 3)
     if not selections:
         print("StoryComposer output unusable - falling back to deterministic scoring.")
-        selections = engine.FallbackSelector().select(view, story, target_cuts)
+        selections = engine.FallbackSelector().select(view, story, target_cuts or 3)
     if not selections:
         raise RuntimeError("Nothing matched - try a different brief.")
 
     selections.sort(key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
     picks = [{"library_id": s["chunk"]["library_id"], "role": s["role"],
               "reason": s.get("reason", ""), "beat": s.get("beat", "")}
-             for s in selections[:target_cuts]]
+             for s in selections[:target_cuts or 10]]
     print(f"Gap fill: {len(picks)} pick(s) for \"{brief}\".")
     return {"picks": picks}
 
@@ -372,7 +411,12 @@ def summarize_params(job_type, params):
             brief = (params.get("brief") or "").strip()
             if len(brief) > 60:
                 brief = brief[:57] + "..."
-            extra = f", {params['target_cuts']} cuts" if params.get("target_cuts") else ""
+            if params.get("target_len"):
+                extra = f", ~{float(params['target_len']) / 60:.0f}m"
+            elif params.get("target_cuts"):
+                extra = f", {params['target_cuts']} cuts"
+            else:
+                extra = ""
             return f"brief: {brief}{extra}" if brief else ""
         if job_type in ("preview", "finalize"):
             return f"version {params.get('version')}"
@@ -463,6 +507,9 @@ def api_project_open():
     total = len(pairs)
     analyzed = sum(1 for st in status.values() if st == "analyzed")
     changed = sum(1 for st in status.values() if st == "changed")
+    kg_store, kg_status = (engine.KnowledgeGraphStore.load(paths["kg"], pairs)
+                           if pairs else (engine.KnowledgeGraphStore(), {}))
+    kg_clips = sum(1 for st in kg_status.values() if st == "analyzed")
     return jsonify({
         "project": project,
         "name": os.path.basename(project),
@@ -472,9 +519,21 @@ def api_project_open():
                     "partial": 0 < analyzed < total,
                     "analyzed_clips": analyzed, "total_clips": total,
                     "changed_clips": changed,
-                    "chunks": len(library.chunks)},
+                    "chunks": len(library.chunks),
+                    "kg_clips": kg_clips},
         "versions": versions_with_files(project),
     })
+
+
+@app.get("/api/project/graph")
+def api_project_graph():
+    project = safe_path(request.args.get("path"))
+    pairs = engine.get_video_pairs(project)
+    paths = project_paths(project)
+    library, _ = engine.ChunkLibrary.load(paths["library"], pairs)
+    kg_store, _ = engine.KnowledgeGraphStore.load(paths["kg"], pairs)
+    graph = engine.KnowledgeGraph.build(kg_store, library)
+    return jsonify(graph.to_json(library))
 
 
 @app.get("/api/project/clips")

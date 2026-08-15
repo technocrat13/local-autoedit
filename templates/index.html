@@ -25,6 +25,7 @@
       <nav id="tabs">
         <button data-tab="clips" class="active">Clips</button>
         <button data-tab="compose">Compose</button>
+        <button data-tab="graph">Graph</button>
         <button data-tab="versions">Versions</button>
         <button data-tab="edl" id="edl-tab" disabled>EDL editor</button>
       </nav>
@@ -42,11 +43,24 @@
           <textarea id="brief" rows="4" placeholder="Leave empty for the default day-in-the-life brief"></textarea>
         </label>
         <div class="row">
-          <label>Target cuts <input id="target-cuts" type="number" value="15" min="3" max="60"></label>
+          <label>Target length (min) <input id="target-len" type="number" min="1" max="60" step="0.5" placeholder="auto"></label>
           <label>Margin (s) <input id="margin" type="number" value="3" min="2" max="5" step="0.5"></label>
         </div>
+        <p class="hint">Leave length blank to let the knowledge graph decide how many cuts cover the day.</p>
         <div id="selected-chips"></div>
         <button id="btn-compose">Compose + preview</button>
+      </section>
+
+      <section id="tab-graph" class="tab">
+        <div id="graph-toolbar">
+          <input id="graph-search" type="text" placeholder="Search entities...">
+          <span id="graph-legend"></span>
+          <span id="graph-empty" class="hint hidden">No knowledge graph yet - run Analyze to build one.</span>
+        </div>
+        <div id="graph-wrap">
+          <canvas id="graph-canvas"></canvas>
+          <div id="graph-panel" class="hidden"></div>
+        </div>
       </section>
 
       <section id="tab-versions" class="tab">

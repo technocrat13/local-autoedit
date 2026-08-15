@@ -146,6 +146,54 @@ td button { margin-right: 5px; font-size: 12px; }
 .picker-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
 label.inline { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-size: 12px; }
 
+#graph-toolbar { display: flex; gap: 14px; align-items: center; margin-bottom: 10px; }
+#graph-search { width: 260px; }
+#graph-legend { display: flex; gap: 12px; font-size: 12px; color: #9aa3af; }
+.legend-item { display: inline-flex; gap: 5px; align-items: center; }
+.legend-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+#graph-wrap {
+  position: relative;
+  height: calc(100vh - 200px);
+  border: 1px solid #2b3038;
+  border-radius: 6px;
+  background: #101318;
+  overflow: hidden;
+}
+#graph-canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+#graph-canvas:active { cursor: grabbing; }
+#graph-panel {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 340px;
+  background: rgba(22, 24, 29, 0.96);
+  border-left: 1px solid #3c4350;
+  padding: 12px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+.gp-head { display: flex; gap: 7px; align-items: center; margin-bottom: 8px; }
+.gp-head .legend-dot { width: 12px; height: 12px; }
+.gp-head button { margin-left: auto; }
+.gp-links { margin-bottom: 10px; color: #9aa3af; }
+.gp-link { cursor: pointer; }
+.gp-link:hover { background: #39414d; }
+.gp-chunk {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid #262b33;
+  cursor: pointer;
+}
+.gp-chunk:hover { background: #1c2027; }
+.gp-chunk img { width: 84px; height: 48px; object-fit: cover; border-radius: 3px; background: #000; flex: none; }
+.gp-chunk .t { color: #7ab7ff; }
+.gp-chunk .i { color: #9aa3af; }
+
 #status-bar {
   position: fixed;
   left: 0; right: 0; bottom: 0;

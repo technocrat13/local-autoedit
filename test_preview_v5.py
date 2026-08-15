@@ -132,7 +132,8 @@ model_loads = []
 ae.load_model = lambda: model_loads.append(1)
 args = types.SimpleNamespace(
     brief="b", footage_dir="/nowhere", output=os.path.join(tmp, "test.mp4"),
-    max_chunks=None, margin=3.0, target_cuts=15, reanalyze=False, finalize=True)
+    max_chunks=None, margin=3.0, target_cuts=15, target_len=None,
+    reanalyze=False, finalize=True)
 with open(os.path.join(tmp, "test_edl.json"), "w") as f:
     json.dump(plan, f)
 OPENED.clear(); RENDERS.clear()
@@ -155,6 +156,8 @@ for i in range(6):
 ae.get_video_pairs = lambda d: [{"lrf": "/fake/DJI_0001.LRF",
                                  "hires": "/fake/DJI_0001.MP4"}]
 ae.ChunkLibrary.load_if_valid = staticmethod(lambda path, pairs: lib)
+# fake LRF paths cannot be fingerprinted; empty graph -> legacy compose path
+ae.sync_knowledge_graph = lambda *a, **k: None
 
 composed = []
 def fake_compose(self, library, story, target_cuts):

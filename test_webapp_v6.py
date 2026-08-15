@@ -294,9 +294,19 @@ ae.ChunkAnalyzer = lambda *a, **k: None
 class _FakeTranscriber:
     def unload(self): pass
 ae.SpeechTranscriber = lambda *a, **k: _FakeTranscriber()
+KG_EXTRACTED = []
+def fake_extract(self, chunks, vocabulary):
+    KG_EXTRACTED.append(chunks[0]["source"])
+    return [{"type": "place", "name": "street", "chunk_ids": [0]}]
+ae.GraphExtractor.extract_clip = fake_extract
 j = run_job({"type": "analyze", "project": projectB, "params": {}})
 check("resume analyzes only remaining clips", j["status"] == "done"
       and ANALYZED == ["DJI_0102.MP4", "DJI_0103.MP4"])
+check("kg extracted for backfilled + new clips",
+      KG_EXTRACTED == ["DJI_0101.MP4", "DJI_0102.MP4", "DJI_0103.MP4"])
+check("kg.json committed per clip", os.path.exists(pathsB["kg"])
+      and len(json.load(open(pathsB["kg"]))["clips"]) == 3)
+check("analyze result counts kg clips", j["result"]["kg_clips"] == 3)
 check("library complete after resume",
       ae.ChunkLibrary.load_if_valid(pathsB["library"], pairsB) is not None)
 data = client.post("/api/project/open", json={"path": projectB}).get_json()
@@ -314,9 +324,11 @@ check("new clip -> partial, existing analysis kept",
       data["library"]["partial"] and data["library"]["analyzed_clips"] == 3
       and data["library"]["total_clips"] == 4 and data["library"]["chunks"] == 3)
 ANALYZED.clear()
+KG_EXTRACTED.clear()
 j = run_job({"type": "analyze", "project": projectB, "params": {}})
 check("only the new clip analyzed", j["status"] == "done"
       and ANALYZED == ["DJI_0104.MP4"])
+check("kg extracted only for the new clip", KG_EXTRACTED == ["DJI_0104.MP4"])
 
 # remove a clip: library stays valid for the remaining clips
 for ext in (".LRF", ".MP4"):
@@ -341,9 +353,12 @@ check("changed clip flagged, others untouched",
       byname["DJI_0103.MP4"]["changed"] and not byname["DJI_0103.MP4"]["analyzed"]
       and byname["DJI_0101.MP4"]["analyzed"] and byname["DJI_0104.MP4"]["analyzed"])
 ANALYZED.clear()
+KG_EXTRACTED.clear()
 j = run_job({"type": "analyze", "project": projectB, "params": {}})
 check("only the changed clip re-analyzed", j["status"] == "done"
       and ANALYZED == ["DJI_0103.MP4"])
+check("kg re-extracted only for the changed clip",
+      KG_EXTRACTED == ["DJI_0103.MP4"])
 
 # library ids stay contiguous for the composer after all the churn
 rlib, rstatus = ae.ChunkLibrary.load(pathsB["library"], pairsB)
@@ -376,6 +391,9 @@ check("v2 cache migrates to sticky format",
       and mlib.clip_entries["DJI_0201.MP4"]["lrf_size"] == 128)
 
 # ---- 10. suggest job: compose-based gap fill --------------------------------------
+# force the legacy compose path here; the graph path gets its own section below
+real_cwg = ae.StoryComposer.compose_with_graph
+ae.StoryComposer.compose_with_graph = lambda self, library, story, graph, **k: []
 # projectB library ids after churn: contiguous 0..N-1 across remaining clips
 rlib, _ = ae.ChunkLibrary.load(pathsB["library"], pairsB)
 all_ids = [c["library_id"] for c in rlib.chunks]
@@ -440,10 +458,71 @@ check("added cut round-trips with exact bounds",
       saved[0]["start"] == 2.5 and saved[0]["end"] == 7.5
       and saved[0]["role"] == "manual" and saved[0]["speech"] == "hello")
 
-# ---- 11. job timestamps, summaries, and persistent history ------------------------
+# ---- 10b. knowledge graph endpoint + graph-driven compose/suggest -----------------
+ae.StoryComposer.compose_with_graph = real_cwg
 # section 9 replaced VideoPreprocessor with a bare lambda; compose's preview
 # render still calls the class-level probe_duration
 ae.VideoPreprocessor.probe_duration = lambda src: 100.0
+
+data = client.post("/api/project/open", json={"path": projectB}).get_json()
+check("project open counts kg clips", data["library"]["kg_clips"] == 3)
+
+gdata = client.get(f"/api/project/graph?path={projectB}").get_json()
+check("graph endpoint returns nodes with chunk refs",
+      any(n["id"] == "place:street" and n["chunks"] for n in gdata["nodes"])
+      and "edges" in gdata and "elements" in gdata)
+
+# graph-driven compose: no target_cuts in params -> compose_with_graph runs
+CWG = {}
+def fake_cwg(self, library, story, graph, target_len=None, margin=3.0,
+             max_total=None):
+    CWG["target_len"] = target_len
+    CWG["max_total"] = max_total
+    CWG["graph_ids"] = sorted(
+        i for n in graph.entities.values() for i in n["chunk_ids"])
+    return [{"chunk": library.chunks[0], "role": "setting",
+             "reason": "graph pick", "beat": "street"}]
+ae.StoryComposer.compose_with_graph = fake_cwg
+j = run_job({"type": "compose", "project": projectB,
+             "params": {"brief": "graph day", "target_len": 300}})
+check("compose without cuts uses the graph", j["status"] == "done"
+      and CWG.get("target_len") == 300.0)
+check("compose params summarized as target length",
+      webapp.summarize_params("compose", {"brief": "graph day",
+                                          "target_len": 300}).endswith("~5m"))
+
+# legacy compose still honored when target_cuts given
+CWG.clear()
+SEEN.clear()
+j = run_job({"type": "compose", "project": projectB,
+             "params": {"brief": "legacy day", "target_cuts": 7}})
+check("explicit target_cuts skips the graph", j["status"] == "done"
+      and not CWG and SEEN.get("brief") == "legacy day")
+
+# suggest: graph restricted to the window's candidates
+rlib, _ = ae.ChunkLibrary.load(pathsB["library"], pairsB)
+all_ids = [c["library_id"] for c in rlib.chunks]
+window_ids = all_ids[:-1]
+CWG.clear()
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "street bit", "candidate_ids": window_ids}})
+check("suggest explores the graph inside the window", j["status"] == "done"
+      and set(CWG.get("graph_ids", [-1])) <= set(window_ids)
+      and CWG.get("max_total") == 10)
+check("graph suggest picks returned",
+      j["result"]["picks"][0]["reason"] == "graph pick")
+
+# graph compose strikes out -> legacy composer takes over
+ae.StoryComposer.compose_with_graph = lambda self, library, story, graph, **k: []
+SEEN.clear()
+j = run_job({"type": "compose", "project": projectB,
+             "params": {"brief": "fallback day"}})
+check("unusable graph falls back to legacy compose", j["status"] == "done"
+      and SEEN.get("brief") == "fallback day")
+# leave the graph path stubbed out so section 11 exercises the legacy compose
+
+
+# ---- 11. job timestamps, summaries, and persistent history ------------------------
 j = run_job({"type": "compose", "project": projectB,
              "params": {"brief": "history test", "target_cuts": 5}})
 check("finished job carries timestamps",

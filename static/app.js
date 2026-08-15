@@ -67,6 +67,7 @@ async function openProject(path) {
   });
   state.project = data;
   state.selectedSources = new Set();
+  resetGraph();
   $("#no-project").classList.add("hidden");
   $("#project").classList.remove("hidden");
   $("#project-name").textContent = data.name;
@@ -74,7 +75,9 @@ async function openProject(path) {
   const changed = lib.changed_clips
     ? ` (${lib.changed_clips} changed on disk)` : "";
   if (lib.exists) {
-    $("#library-status").textContent = `library: ${lib.chunks} chunks`;
+    const kg = lib.kg_clips < lib.total_clips
+      ? `, graph ${lib.kg_clips}/${lib.total_clips} clips` : ", graph ready";
+    $("#library-status").textContent = `library: ${lib.chunks} chunks${kg}`;
   } else if (lib.partial) {
     $("#library-status").textContent =
       `analyzed ${lib.analyzed_clips}/${lib.total_clips} clips${changed} - analyze to finish`;
@@ -292,7 +295,7 @@ function pickerCandidates(gap, showAll) {
 
 function openPicker(gap) {
   state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, roles: {},
-                   aiStatus: "", query: "", cuts: 3 };
+                   aiStatus: "", query: "" };
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -314,7 +317,6 @@ function renderPicker() {
     `<button id="picker-close" class="linkish">close</button></div>` +
     `<div class="picker-ai">` +
     `<input id="picker-query" type="text" value="${esc(p.query)}" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
-    `<label class="inline">cuts <input id="picker-cuts" class="num" type="number" value="${p.cuts}" min="1" max="10"></label>` +
     `<button id="picker-suggest" data-empty="${candidates.length ? 0 : 1}"` +
     `${candidates.length && !state.busy ? "" : " disabled"}` +
     `${state.busy ? ' title="another job is running"' : ""}>Compose gap fill</button>` +
@@ -347,9 +349,6 @@ function renderPicker() {
   $("#picker-close").onclick = () => { state.picker = null; renderEdl(); };
   $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
   $("#picker-query").oninput = (e) => { p.query = e.target.value; };
-  $("#picker-cuts").oninput = (e) => {
-    p.cuts = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3));
-  };
   $("#picker-suggest").onclick = () => runSuggest(candidates);
   $("#picker-add").onclick = () => addPicked(candidates);
   box.querySelectorAll(".pick-card").forEach((card) => {
@@ -387,7 +386,6 @@ async function runSuggest(candidates) {
         type: "suggest", project: state.project.project,
         params: {
           brief,
-          target_cuts: p.cuts,
           candidate_ids: candidates.map((c) => c.library_id),
         },
       }),
@@ -713,6 +711,303 @@ function playVideo(file, start, end) {
 }
 
 // ---------------------------------------------------------------------------
+// Knowledge graph explorer
+// ---------------------------------------------------------------------------
+const GRAPH_COLORS = {
+  thread: "#e8b350", place: "#7ab7ff", activity: "#7dd87d",
+  person: "#e88ad0", object: "#9aa3af", mood: "#d6c37a",
+};
+
+const graph = {
+  data: null, nodes: [], edges: [], byId: {},
+  selected: null, search: "",
+  panX: 0, panY: 0, zoom: 1,
+  animFrame: null, loading: false,
+};
+
+function resetGraph() {
+  if (graph.animFrame) cancelAnimationFrame(graph.animFrame);
+  graph.data = null;
+  graph.nodes = [];
+  graph.edges = [];
+  graph.byId = {};
+  graph.selected = null;
+  graph.search = "";
+  graph.panX = 0;
+  graph.panY = 0;
+  graph.zoom = 1;
+  graph.animFrame = null;
+  graph.loading = false;
+  const search = $("#graph-search");
+  if (search) search.value = "";
+  const panel = $("#graph-panel");
+  if (panel) { panel.classList.add("hidden"); panel.innerHTML = ""; }
+}
+
+async function loadGraph() {
+  if (graph.loading || !state.project) return;
+  graph.loading = true;
+  try {
+    const data = await api(`/api/project/graph?path=${encodeURIComponent(state.project.project)}`);
+    graph.data = data;
+    $("#graph-empty").classList.toggle("hidden", data.nodes.length > 0);
+    buildGraphLayout(data);
+    renderGraphLegend(data);
+    startGraphSim();
+  } catch (e) {
+    $("#graph-empty").textContent = "Graph unavailable: " + e.message;
+    $("#graph-empty").classList.remove("hidden");
+  } finally {
+    graph.loading = false;
+  }
+}
+
+function buildGraphLayout(data) {
+  const canvas = $("#graph-canvas");
+  const w = canvas.clientWidth || 800;
+  const h = canvas.clientHeight || 500;
+  const elements = new Set(data.elements || []);
+  graph.nodes = data.nodes.map((n, i) => {
+    const angle = (i / Math.max(1, data.nodes.length)) * 2 * Math.PI;
+    return {
+      ...n,
+      element: elements.has(n.id),
+      x: w / 2 + Math.cos(angle) * Math.min(w, h) * 0.33,
+      y: h / 2 + Math.sin(angle) * Math.min(w, h) * 0.33,
+      vx: 0, vy: 0,
+      r: Math.min(26, 7 + Math.sqrt(n.chunk_count) * 3),
+    };
+  });
+  graph.byId = Object.fromEntries(graph.nodes.map((n) => [n.id, n]));
+  graph.edges = (data.edges || [])
+    .filter((e) => graph.byId[e.a] && graph.byId[e.b]);
+  graph.panX = 0;
+  graph.panY = 0;
+  graph.zoom = 1;
+}
+
+function startGraphSim() {
+  if (graph.animFrame) cancelAnimationFrame(graph.animFrame);
+  const canvas = $("#graph-canvas");
+  let ticks = 0;
+  const step = () => {
+    const w = canvas.clientWidth || 800;
+    const h = canvas.clientHeight || 500;
+    if (ticks < 300) {
+      simTick(w, h);
+      ticks += 1;
+    }
+    drawGraph();
+    graph.animFrame = ticks < 300 ? requestAnimationFrame(step) : null;
+  };
+  graph.animFrame = requestAnimationFrame(step);
+}
+
+function simTick(w, h) {
+  const nodes = graph.nodes;
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    // gentle pull to center keeps disconnected nodes on screen
+    a.vx += (w / 2 - a.x) * 0.0015;
+    a.vy += (h / 2 - a.y) * 0.0015;
+    for (let j = i + 1; j < nodes.length; j++) {
+      const b = nodes[j];
+      let dx = a.x - b.x, dy = a.y - b.y;
+      let d2 = dx * dx + dy * dy;
+      if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+      const force = 900 / d2;
+      const d = Math.sqrt(d2);
+      const fx = (dx / d) * force, fy = (dy / d) * force;
+      a.vx += fx; a.vy += fy;
+      b.vx -= fx; b.vy -= fy;
+    }
+  }
+  for (const e of graph.edges) {
+    const a = graph.byId[e.a], b = graph.byId[e.b];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    const pull = (d - 90) * 0.002 * Math.min(3, e.weight);
+    const fx = (dx / d) * pull, fy = (dy / d) * pull;
+    a.vx += fx; a.vy += fy;
+    b.vx -= fx; b.vy -= fy;
+  }
+  for (const n of nodes) {
+    n.vx *= 0.85; n.vy *= 0.85;
+    n.x += n.vx; n.y += n.vy;
+  }
+}
+
+function graphMatches(n) {
+  if (!graph.search) return true;
+  return n.name.includes(graph.search) || n.type.includes(graph.search);
+}
+
+function drawGraph() {
+  const canvas = $("#graph-canvas");
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.translate(graph.panX, graph.panY);
+  ctx.scale(graph.zoom, graph.zoom);
+
+  for (const e of graph.edges) {
+    const a = graph.byId[e.a], b = graph.byId[e.b];
+    const lit = graphMatches(a) && graphMatches(b);
+    ctx.strokeStyle = lit ? "rgba(122, 183, 255, 0.25)" : "rgba(122, 183, 255, 0.06)";
+    ctx.lineWidth = Math.min(4, 0.5 + e.weight * 0.5);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  for (const n of graph.nodes) {
+    const lit = graphMatches(n);
+    ctx.globalAlpha = lit ? 1 : 0.18;
+    ctx.fillStyle = GRAPH_COLORS[n.type] || "#9aa3af";
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r, 0, 2 * Math.PI);
+    ctx.fill();
+    if (n.id === graph.selected) {
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    } else if (n.element) {
+      ctx.strokeStyle = "rgba(255,255,255,0.45)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.fillStyle = lit ? "#e6e9ef" : "#9aa3af";
+    ctx.font = "11px -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(n.name, n.x, n.y + n.r + 12);
+    ctx.globalAlpha = 1;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function graphNodeAt(clientX, clientY) {
+  const rect = $("#graph-canvas").getBoundingClientRect();
+  const x = (clientX - rect.left - graph.panX) / graph.zoom;
+  const y = (clientY - rect.top - graph.panY) / graph.zoom;
+  for (let i = graph.nodes.length - 1; i >= 0; i--) {
+    const n = graph.nodes[i];
+    const dx = x - n.x, dy = y - n.y;
+    if (dx * dx + dy * dy <= (n.r + 4) * (n.r + 4)) return n;
+  }
+  return null;
+}
+
+function renderGraphLegend(data) {
+  const counts = {};
+  for (const n of data.nodes) counts[n.type] = (counts[n.type] || 0) + 1;
+  $("#graph-legend").innerHTML = Object.entries(GRAPH_COLORS)
+    .filter(([type]) => counts[type])
+    .map(([type, color]) =>
+      `<span class="legend-item"><span class="legend-dot" style="background:${color}"></span>${type} (${counts[type]})</span>`)
+    .join("");
+}
+
+function renderGraphPanel(node) {
+  const panel = $("#graph-panel");
+  if (!node) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+  panel.classList.remove("hidden");
+  const links = graph.edges
+    .filter((e) => e.a === node.id || e.b === node.id)
+    .map((e) => graph.byId[e.a === node.id ? e.b : e.a])
+    .filter(Boolean);
+  panel.innerHTML =
+    `<div class="gp-head"><span class="legend-dot" style="background:${GRAPH_COLORS[node.type]}"></span>` +
+    `<strong>${esc(node.name)}</strong> <span class="hint">${esc(node.type)}</span>` +
+    `<button id="gp-close" class="linkish">close</button></div>` +
+    (links.length
+      ? `<div class="gp-links">appears with: ` +
+        links.slice(0, 8).map((l) => `<span class="chip gp-link" data-id="${esc(l.id)}">${esc(l.name)}</span>`).join(" ") + `</div>`
+      : "") +
+    `<div class="gp-chunks">` + node.chunks.map((c) =>
+      `<div class="gp-chunk" data-source="${esc(c.source)}" data-start="${c.start}" data-end="${c.end}">` +
+      `<img loading="lazy" src="/api/thumb?path=${encodeURIComponent(state.project.project)}&clip=${encodeURIComponent(c.source)}" alt="">` +
+      `<div><span class="t">${esc(c.source)} ${c.start.toFixed(0)}-${c.end.toFixed(0)}s</span>` +
+      ` <span class="i">i=${(c.interest || 0).toFixed(2)}</span>` +
+      `<div>${esc(c.summary)}</div></div></div>`).join("") + `</div>`;
+  $("#gp-close").onclick = () => {
+    graph.selected = null;
+    renderGraphPanel(null);
+    drawGraph();
+  };
+  panel.querySelectorAll(".gp-link").forEach((el) => {
+    el.onclick = () => selectGraphNode(el.dataset.id);
+  });
+  panel.querySelectorAll(".gp-chunk").forEach((el) => {
+    el.onclick = () => {
+      const file = lrfName(el.dataset.source);
+      if (!file) return alert("No LRF proxy known for this clip.");
+      playVideo(file, parseFloat(el.dataset.start), parseFloat(el.dataset.end));
+    };
+  });
+}
+
+function selectGraphNode(id) {
+  graph.selected = id;
+  renderGraphPanel(graph.byId[id] || null);
+  drawGraph();
+}
+
+function wireGraphCanvas() {
+  const canvas = $("#graph-canvas");
+  let dragging = false, moved = false, lastX = 0, lastY = 0;
+  canvas.onmousedown = (e) => {
+    dragging = true; moved = false;
+    lastX = e.clientX; lastY = e.clientY;
+  };
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+    graph.panX += dx;
+    graph.panY += dy;
+    lastX = e.clientX; lastY = e.clientY;
+    drawGraph();
+  });
+  window.addEventListener("mouseup", (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (!moved && e.target === canvas) {
+      const node = graphNodeAt(e.clientX, e.clientY);
+      selectGraphNode(node ? node.id : null);
+      if (!node) renderGraphPanel(null);
+    }
+  });
+  canvas.onwheel = (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    const next = Math.max(0.25, Math.min(4, graph.zoom * factor));
+    // zoom around the cursor
+    graph.panX = mx - (mx - graph.panX) * (next / graph.zoom);
+    graph.panY = my - (my - graph.panY) * (next / graph.zoom);
+    graph.zoom = next;
+    drawGraph();
+  };
+  $("#graph-search").oninput = (e) => {
+    graph.search = e.target.value.trim().toLowerCase();
+    drawGraph();
+  };
+}
+wireGraphCanvas();
+
+// ---------------------------------------------------------------------------
 // Tabs + wiring
 // ---------------------------------------------------------------------------
 function showTab(name) {
@@ -720,6 +1015,8 @@ function showTab(name) {
     b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach((t) =>
     t.classList.toggle("active", t.id === `tab-${name}`));
+  if (name === "graph" && !graph.data) loadGraph();
+  else if (name === "graph") drawGraph();
 }
 
 document.querySelectorAll("#tabs button").forEach((b) => {
@@ -727,12 +1024,15 @@ document.querySelectorAll("#tabs button").forEach((b) => {
 });
 
 $("#btn-analyze").onclick = () => startJob("analyze", {});
-$("#btn-compose").onclick = () => startJob("compose", {
-  brief: $("#brief").value.trim(),
-  target_cuts: parseInt($("#target-cuts").value, 10) || 15,
-  margin: parseFloat($("#margin").value) || 3,
-  sources: [...state.selectedSources],
-});
+$("#btn-compose").onclick = () => {
+  const minutes = parseFloat($("#target-len").value);
+  startJob("compose", {
+    brief: $("#brief").value.trim(),
+    target_len: minutes > 0 ? minutes * 60 : null,
+    margin: parseFloat($("#margin").value) || 3,
+    sources: [...state.selectedSources],
+  });
+};
 $("#btn-edl-save").onclick = saveEdl;
 $("#job-close").onclick = () => $("#job-drawer").classList.add("hidden");
 $("#status-bar").onclick = toggleDrawer;
