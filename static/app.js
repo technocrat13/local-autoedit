@@ -7,7 +7,8 @@ const state = {
   project: null,          // { project, name, pairs, library, versions }
   selectedSources: new Set(),
   edl: null,              // { version, cuts: [{cut, enabled, added}], allChunks }
-  picker: null,           // { gap, showAll, checked, reasons, aiStatus }
+  picker: null,           // { mode: "insert"|"section", gap, showAll, checked, reasons, aiStatus }
+  section: null,          // { a: idx, b: idx|null } - recreate-section anchors
   pollTimer: null,
   activeJob: null,
   busy: false,
@@ -191,6 +192,7 @@ async function loadEdl(version) {
     allChunks,
   };
   state.picker = null;
+  state.section = null;
   $("#edl-tab").disabled = false;
   $("#edl-title").textContent = `Editing v${version} (${data.cuts.length} cuts)`;
   renderEdl();
@@ -210,13 +212,20 @@ function renderEdl() {
   const tbody = $("#edl-table tbody");
   tbody.innerHTML = "";
   tbody.appendChild(insertRow(0));
+  const range = sectionRange();
+  const anchor = state.section ? [state.section.a, state.section.b] : [];
   state.edl.cuts.forEach((row, idx) => {
     const c = row.cut;
     const tr = document.createElement("tr");
-    tr.className = (row.enabled ? "" : "disabled-cut") + (row.added ? " added-cut" : "");
+    const isAnchor = anchor.includes(idx);
+    const isMid = range && idx > range.a && idx < range.b;
+    tr.className = (row.enabled ? "" : "disabled-cut") + (row.added ? " added-cut" : "")
+      + (isAnchor ? " sec-anchor" : "") + (isMid ? " sec-mid" : "");
     tr.draggable = true;
     tr.dataset.idx = idx;
     tr.innerHTML =
+      `<td><button class="sec-handle" title="mark section start/end">` +
+      `${isAnchor ? "&#9679;" : isMid ? "&#9617;" : "&#9675;"}</button></td>` +
       `<td class="drag">&#8942;&#8942;</td>` +
       `<td><input type="checkbox" ${row.enabled ? "checked" : ""}></td>` +
       `<td>${esc(c.source || "")}</td>` +
@@ -226,9 +235,10 @@ function renderEdl() {
       `<td class="summary-cell">${esc(c.summary || "")}` +
       (c.speech ? `<div class="speech">&ldquo;${esc(c.speech)}&rdquo;</div>` : "") + `</td>` +
       `<td><button class="cut-play" title="preview this cut from the LRF proxy">&#9654;</button></td>`;
+    tr.querySelector(".sec-handle").onclick = () => clickSectionHandle(idx);
     tr.querySelector('input[type="checkbox"]').onchange = (e) => {
       row.enabled = e.target.checked;
-      tr.className = (row.enabled ? "" : "disabled-cut") + (row.added ? " added-cut" : "");
+      renderEdl();
     };
     const [startInput, endInput] = tr.querySelectorAll(".num");
     startInput.onchange = () => { c.start = parseFloat(startInput.value); };
@@ -247,22 +257,97 @@ function renderEdl() {
       if (from === to) return;
       const [moved] = state.edl.cuts.splice(from, 1);
       state.edl.cuts.splice(to, 0, moved);
-      if (state.picker) state.picker = null;
+      state.picker = null;
+      state.section = null;
       renderEdl();
     };
     tbody.appendChild(tr);
     tbody.appendChild(insertRow(idx + 1));
   });
+  renderSectionHint();
   renderPicker();
 }
 
 function insertRow(gap) {
   const tr = document.createElement("tr");
-  tr.className = "insert-row" + (state.picker && state.picker.gap === gap ? " active" : "");
+  const active = state.picker && state.picker.mode === "insert" && state.picker.gap === gap;
+  tr.className = "insert-row" + (active ? " active" : "");
   const cols = $("#edl-table thead tr").children.length;
   tr.innerHTML = `<td colspan="${cols}"><button class="linkish">+ add clip here</button></td>`;
   tr.querySelector("button").onclick = () => openPicker(gap);
   return tr;
+}
+
+// ---------------------------------------------------------------------------
+// Section selection (recreate the story between two cuts)
+// ---------------------------------------------------------------------------
+function sectionRange() {
+  const s = state.section;
+  if (!s || s.b === null) return null;
+  return { a: s.a, b: s.b };
+}
+
+function clickSectionHandle(idx) {
+  const s = state.section;
+  if (!s) {
+    state.section = { a: idx, b: null };
+  } else if (s.b === null) {
+    if (idx === s.a) {
+      state.section = null;
+    } else {
+      state.section = { a: Math.min(s.a, idx), b: Math.max(s.a, idx) };
+      openSectionPicker();
+      return;
+    }
+  } else if (idx === s.a || idx === s.b) {
+    state.section = null;
+    if (state.picker && state.picker.mode === "section") state.picker = null;
+  } else {
+    state.section = { a: idx, b: null };
+    if (state.picker && state.picker.mode === "section") state.picker = null;
+  }
+  renderEdl();
+}
+
+function clearSection() {
+  state.section = null;
+  if (state.picker && state.picker.mode === "section") state.picker = null;
+  renderEdl();
+}
+
+function renderSectionHint() {
+  const hint = $("#edl-sel-hint");
+  const s = state.section;
+  if (!s) { hint.textContent = ""; return; }
+  if (s.b === null) {
+    const c = state.edl.cuts[s.a].cut;
+    hint.textContent = `section start: ${c.source} @${c.start.toFixed(0)}s - click another handle to mark the end`;
+  } else {
+    hint.textContent = `section: cut ${s.a + 1} → cut ${s.b + 1} (${s.b - s.a - 1} cut(s) in between)`;
+  }
+}
+
+function openSectionPicker() {
+  state.picker = { mode: "section", gap: null, showAll: false, checked: new Set(),
+                   reasons: {}, roles: {}, aiStatus: "", query: "" };
+  renderEdl();
+  $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function sectionCandidates() {
+  const r = sectionRange();
+  const cutA = state.edl.cuts[r.a].cut;
+  const cutB = state.edl.cuts[r.b].cut;
+  const lo = [cutA.source, cutA.end];
+  const hi = [cutB.source, cutB.start];
+  if (posCmp(lo, hi) >= 0) return [];
+  return state.edl.allChunks.filter((c) =>
+    posCmp([c.source, c.start], lo) >= 0 &&
+    posCmp([c.source, c.end], hi) <= 0 &&
+    !state.edl.cuts.some((row, idx) => row.enabled
+      && !(idx > r.a && idx < r.b)  // the middle cuts are being replaced
+      && row.cut.source === c.source
+      && row.cut.start < c.end && c.start < row.cut.end));
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +379,9 @@ function pickerCandidates(gap, showAll) {
 }
 
 function openPicker(gap) {
-  state.picker = { gap, showAll: false, checked: new Set(), reasons: {}, roles: {},
-                   aiStatus: "", query: "" };
+  state.picker = { mode: "insert", gap, showAll: false, checked: new Set(),
+                   reasons: {}, roles: {}, aiStatus: "", query: "" };
+  if (state.section) state.section = null;
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -305,21 +391,39 @@ function renderPicker() {
   const p = state.picker;
   if (!p) { box.classList.add("hidden"); box.innerHTML = ""; return; }
   box.classList.remove("hidden");
-  const { prev, next } = pickerWindow(p.gap);
-  const candidates = pickerCandidates(p.gap, p.showAll);
-  const where = p.showAll
-    ? "anywhere (unused chunks)"
-    : `between ${prev ? `${esc(prev.source)} @${prev.end.toFixed(0)}s` : "the start"}` +
-      ` and ${next ? `${esc(next.source)} @${next.start.toFixed(0)}s` : "the end"}`;
+  const isSection = p.mode === "section";
+  let candidates, heading, midCount = 0;
+  if (isSection) {
+    const r = sectionRange();
+    if (!r) { state.picker = null; box.classList.add("hidden"); return; }
+    const a = state.edl.cuts[r.a].cut;
+    const b = state.edl.cuts[r.b].cut;
+    candidates = sectionCandidates();
+    midCount = r.b - r.a - 1;
+    heading = `Recreate section between ${esc(a.source)} @${a.end.toFixed(0)}s ` +
+      `and ${esc(b.source)} @${b.start.toFixed(0)}s` +
+      (midCount ? ` <span class="hint">(replaces ${midCount} cut(s))</span>` : "");
+  } else {
+    const { prev, next } = pickerWindow(p.gap);
+    candidates = pickerCandidates(p.gap, p.showAll);
+    heading = "Add clip " + (p.showAll
+      ? "anywhere (unused chunks)"
+      : `between ${prev ? `${esc(prev.source)} @${prev.end.toFixed(0)}s` : "the start"}` +
+        ` and ${next ? `${esc(next.source)} @${next.start.toFixed(0)}s` : "the end"}`);
+  }
+  const placeholder = isSection
+    ? "brief for this section, e.g. 'the walk to the lighthouse, keep it moody'"
+    : "brief for this gap, e.g. 'the coffee stop, keep it light'";
 
   box.innerHTML =
-    `<div class="picker-head"><strong>Add clip ${where}</strong>` +
+    `<div class="picker-head"><strong>${heading}</strong>` +
     `<button id="picker-close" class="linkish">close</button></div>` +
     `<div class="picker-ai">` +
-    `<input id="picker-query" type="text" value="${esc(p.query)}" placeholder="brief for this gap, e.g. 'the coffee stop, keep it light'">` +
+    `<input id="picker-query" type="text" value="${esc(p.query)}" placeholder="${placeholder}">` +
     `<button id="picker-suggest" data-empty="${candidates.length ? 0 : 1}"` +
     `${candidates.length && !state.busy ? "" : " disabled"}` +
-    `${state.busy ? ' title="another job is running"' : ""}>Compose gap fill</button>` +
+    `${state.busy ? ' title="another job is running"' : ""}>` +
+    `${isSection ? "Recreate story" : "Compose gap fill"}</button>` +
     `<span id="picker-ai-status" class="hint">${esc(p.aiStatus)}</span></div>` +
     (candidates.length
       ? `<div class="picker-grid">` + candidates.map((c) => {
@@ -330,7 +434,9 @@ function renderPicker() {
             `<div class="pick-info">` +
             `<div><span class="t">${esc(c.source)} ${c.start.toFixed(0)}-${c.end.toFixed(0)}s</span>` +
             ` <span class="i">i=${(c.interest || 0).toFixed(2)}</span>` +
-            (chunkInEdit(c) ? ` <span class="badge waiting">in edit</span>` : "") + `</div>` +
+            (chunkInEdit(c)
+              ? ` <span class="badge waiting">${isSection ? "in old section" : "in edit"}</span>`
+              : "") + `</div>` +
             `<div>${esc(c.summary)}</div>` +
             (c.transcript ? `<div class="speech">&ldquo;${esc(c.transcript)}&rdquo;</div>` : "") +
             (reason ? `<div class="ai-reason">${p.roles[c.library_id] ? esc(p.roles[c.library_id]) + ": " : ""}${esc(reason)}</div>` : "") +
@@ -340,14 +446,28 @@ function renderPicker() {
             `<input type="checkbox" ${checked ? "checked" : ""}>` +
             `</div></div>`;
         }).join("") + `</div>`
-      : `<div class="hint">No unused chunks fall between these two cuts.</div>`) +
+      : `<div class="hint">${isSection
+          ? "No chunks fall between these two cuts."
+          : "No unused chunks fall between these two cuts."}</div>`) +
     `<div class="picker-foot">` +
-    `<label class="inline"><input id="picker-showall" type="checkbox" ${p.showAll ? "checked" : ""}> show all unused chunks</label>` +
-    `<button id="picker-add" ${p.checked.size ? "" : "disabled"}>Add selected (${p.checked.size})</button>` +
+    (isSection
+      ? `<button id="picker-clear-sec" class="linkish">clear selection</button>` +
+        `<button id="picker-add" ${p.checked.size ? "" : "disabled"}>` +
+        `Replace section (${p.checked.size} cut(s))</button>`
+      : `<label class="inline"><input id="picker-showall" type="checkbox" ${p.showAll ? "checked" : ""}> show all unused chunks</label>` +
+        `<button id="picker-add" ${p.checked.size ? "" : "disabled"}>Add selected (${p.checked.size})</button>`) +
     `</div>`;
 
-  $("#picker-close").onclick = () => { state.picker = null; renderEdl(); };
-  $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
+  $("#picker-close").onclick = () => {
+    state.picker = null;
+    if (isSection) state.section = null;
+    renderEdl();
+  };
+  if (isSection) {
+    $("#picker-clear-sec").onclick = clearSection;
+  } else {
+    $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
+  }
   $("#picker-query").oninput = (e) => { p.query = e.target.value; };
   $("#picker-suggest").onclick = () => runSuggest(candidates);
   $("#picker-add").onclick = () => addPicked(candidates);
@@ -370,7 +490,9 @@ function renderPicker() {
 async function runSuggest(candidates) {
   const p = state.picker;
   const brief = p.query.trim();
-  if (!brief) return alert("Give a brief for this gap first.");
+  if (!brief) return alert(p.mode === "section"
+    ? "Give a brief for this section first."
+    : "Give a brief for this gap first.");
   p.query = brief;
   p.aiStatus = "submitting…";
   renderPicker();
@@ -439,7 +561,13 @@ function addPicked(candidates) {
       },
     };
   });
-  state.edl.cuts.splice(p.gap, 0, ...rows);
+  if (p.mode === "section") {
+    const r = sectionRange();
+    state.edl.cuts.splice(r.a + 1, r.b - r.a - 1, ...rows);
+    state.section = null;
+  } else {
+    state.edl.cuts.splice(p.gap, 0, ...rows);
+  }
   state.picker = null;
   renderEdl();
 }
@@ -453,6 +581,7 @@ async function saveEdl() {
       body: JSON.stringify({ path: state.project.project, base_version: state.edl.version, cuts }),
     });
     state.picker = null;
+    state.section = null;
     $("#edl-picker").classList.add("hidden");
     await refreshProject();
     showTab("versions");
@@ -1034,6 +1163,9 @@ $("#btn-compose").onclick = () => {
   });
 };
 $("#btn-edl-save").onclick = saveEdl;
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.section && state.edl) clearSection();
+});
 $("#job-close").onclick = () => $("#job-drawer").classList.add("hidden");
 $("#status-bar").onclick = toggleDrawer;
 state.elapsedTimer = setInterval(tickElapsed, 1000);

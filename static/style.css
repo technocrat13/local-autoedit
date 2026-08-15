@@ -95,36 +95,79 @@ td button { margin-right: 5px; font-size: 12px; }
 .added-cut td { background: #1c2a1e; }
 .cut-play { padding: 2px 8px; }
 
+#edl-toolbar {
+  position: sticky;
+  top: -16px;  /* cancel #main's top padding so the bar pins to the pane edge */
+  z-index: 4;
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  background: #16181d;
+  padding: 8px 0;
+  border-bottom: 1px solid #2b3038;
+  margin-bottom: 8px;
+}
+#edl-toolbar h3 { margin: 0; }
+#edl-sel-hint { margin-left: auto; }
+#edl-body { display: flex; gap: 14px; align-items: flex-start; }
+#edl-table-wrap { flex: 1; min-width: 0; }
+
+.sec-handle {
+  background: none;
+  border: none;
+  color: #4a5262;
+  font-size: 13px;
+  padding: 2px 4px;
+}
+.sec-handle:hover:not(:disabled) { background: none; color: #7ab7ff; }
+tr.sec-anchor .sec-handle { color: #7ab7ff; }
+tr.sec-anchor td { background: #1d2735; }
+tr.sec-mid .sec-handle { color: #e8b350; }
+tr.sec-mid td { background: #241f16; }
+
 .insert-row td { border-bottom: none; padding: 0 8px; }
 .insert-row button {
   width: 100%;
   text-align: center;
-  border: 1px dashed #3c4350;
+  border: none;
+  border-top: 1px dashed transparent;
   border-radius: 4px;
   background: none;
-  color: #9aa3af;
+  color: transparent;
   font-size: 11px;
-  padding: 1px 0;
-  opacity: 0.5;
+  padding: 0;
+  line-height: 8px;
+  height: 8px;
 }
-.insert-row button:hover, .insert-row.active button { opacity: 1; color: #7ab7ff; background: none; }
-.insert-row.active button { border-color: #7ab7ff; }
+.insert-row:hover button, .insert-row.active button {
+  color: #7ab7ff;
+  border-top-color: #3c4350;
+  height: auto;
+  line-height: normal;
+  padding: 1px 0;
+}
+.insert-row.active button { border-top-color: #7ab7ff; }
 
 #edl-picker {
-  margin-top: 14px;
+  position: sticky;
+  top: 36px;
+  width: 380px;
+  flex: none;
+  max-height: calc(100vh - 130px);
+  overflow-y: auto;
   border: 1px solid #3c4350;
   border-radius: 6px;
   padding: 12px;
   background: #1c2027;
 }
-.picker-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-.picker-ai { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-.picker-ai input[type="text"] { flex: 1; max-width: 480px; }
+.picker-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.picker-ai { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.picker-ai input[type="text"] { flex: 1; min-width: 160px; }
 .picker-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
-  max-height: 45vh;
+  max-height: 52vh;
   overflow-y: auto;
 }
 .pick-card {

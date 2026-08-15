@@ -297,7 +297,7 @@ ae.SpeechTranscriber = lambda *a, **k: _FakeTranscriber()
 KG_EXTRACTED = []
 def fake_extract(self, chunks, vocabulary):
     KG_EXTRACTED.append(chunks[0]["source"])
-    return [{"type": "place", "name": "street", "chunk_ids": [0]}]
+    return [{"type": "place", "name": "street", "chunk_ids": [0]}], True
 ae.GraphExtractor.extract_clip = fake_extract
 j = run_job({"type": "analyze", "project": projectB, "params": {}})
 check("resume analyzes only remaining clips", j["status"] == "done"

@@ -87,37 +87,130 @@ for pair in pairs:
 
 clip_chunks = {s: [c for c in lib.chunks if c["source"] == s] for s in SOURCES}
 
-# ---- 1. GraphExtractor validation ---------------------------------------------
+# ---- 1. GraphExtractor: seeds, ranges, canonicalize, semantic, retry ----------
 extractor = ae.GraphExtractor()
 
-ae._llm_text = fake_llm(json.dumps({"entities": [
-    {"type": "place", "name": "  The   Beach ", "chunk_ids": [0, 1, 2]},
-    {"type": "person", "name": "man in red cap", "chunk_ids": [3, "4", 99, -1]},
-    {"type": "place", "name": "the beach", "chunk_ids": [5]},   # dup after normalize
-    {"type": "spaceship", "name": "ufo", "chunk_ids": [0]},     # unknown type
-    {"type": "mood", "name": "chill", "chunk_ids": []},         # no valid ids
-    "not a dict",
-]}))
-ents = extractor.extract_clip(clip_chunks[SOURCES[0]], {t: [] for t in ae.KG_ENTITY_TYPES})
-check("extractor normalizes names", any(e["name"] == "the beach" for e in ents))
-check("extractor keeps valid entities only", len(ents) == 2)
-person = next(e for e in ents if e["type"] == "person")
-check("extractor clamps + coerces chunk_ids", person["chunk_ids"] == [3, 4])
+def mk(i, scene="beach", actions=(), tags=(), emotions=(), summary=None, speech=""):
+    return {"source": "X.MP4", "hires_path": "/fake/X.MP4",
+            "start": i * 5.0, "end": i * 5.0 + 5, "scene": scene,
+            "visual_tags": list(tags), "actions": list(actions),
+            "people_count": 1, "emotions": list(emotions),
+            "transition_flag": False,
+            "one_line_summary": summary or f"moment {i}",
+            "interest_score": 0.5, "clip_duration": 60.0,
+            "audio": {"loudness_peak_db": -12.0},
+            "speech": {"transcript": speech, "has_speech": bool(speech),
+                       "language": "en"}}
 
-ae._llm_text = fake_llm("total garbage")
-check("garbage extraction -> []",
-      extractor.extract_clip(clip_chunks[SOURCES[0]], {}) == [])
+# 1a. deterministic seeds - no LLM involved
+seed_chunks = ([mk(i, scene="Sandy  Beach", actions=["walking"], tags=["drone"])
+                for i in range(2)]
+               + [mk(2, scene="unknown", actions=["juggling"], tags=["drone"])]
+               + [mk(i, scene="sandy beach", emotions=["joy"])
+                  for i in range(3, 8)])
+seeds = ae.GraphExtractor._seed_terms(seed_chunks)
+check("seed place from scene, normalized",
+      seeds.get(("place", "sandy beach")) == {0, 1, 3, 4, 5, 6, 7})
+check("seed skips unknown scene",
+      not any(k == ("place", "unknown") for k in seeds))
+check("seed activity/object need 2 chunks",
+      ("activity", "walking") in seeds and ("object", "drone") in seeds
+      and ("activity", "juggling") not in seeds)
+check("seed mood from emotions", seeds[("mood", "joy")] == {3, 4, 5, 6, 7})
 
-vocab_seen = {}
-def vocab_llm(system, user, max_tokens):
-    vocab_seen["user"] = user
-    return json.dumps({"entities": [
-        {"type": "place", "name": "the beach", "chunk_ids": [0]}]})
-ae._llm_text = vocab_llm
-extractor.extract_clip(clip_chunks[SOURCES[1]],
-                       {"place": ["the beach"], "person": ["man in red cap"]})
-check("vocabulary appears in prompt",
-      "the beach" in vocab_seen["user"] and "man in red cap" in vocab_seen["user"])
+small = [mk(0, actions=["surfing"]), mk(1), mk(2)]
+check("small clip keeps single-chunk terms",
+      ("activity", "surfing") in ae.GraphExtractor._seed_terms(small))
+
+mood_chunks = [mk(i, emotions=[f"mood{i % 7}"]) for i in range(14)]
+mood_seeds = ae.GraphExtractor._seed_terms(mood_chunks)
+check("mood seeds capped at 5",
+      sum(1 for k in mood_seeds if k[0] == "mood") == 5)
+
+# 1b. parse_id_ranges
+check("parse_id_ranges ranges + singles",
+      ae.parse_id_ranges("3-7,12", 20) == [3, 4, 5, 6, 7, 12])
+check("parse_id_ranges clamps + skips garbage",
+      ae.parse_id_ranges("8-15, x, -2, 3", 10) == [3, 8, 9])
+check("parse_id_ranges reversed range",
+      ae.parse_id_ranges("7-3", 10) == [3, 4, 5, 6, 7])
+check("parse_id_ranges accepts int list",
+      ae.parse_id_ranges([1, "2", 99], 10) == [1, 2])
+
+# 1c. full pipeline: canned merges + semantic entities
+LONG = ("a man in a red cap wanders up and down the shoreline scanning "
+        "the waves for any sign of his missing drone")
+clip = ([mk(i, scene="sandy beach", actions=["swimming"], summary=LONG,
+            speech="where did the drone go") for i in range(4)]
+        + [mk(i, scene="sandy beach") for i in range(4, 8)])
+
+prompts = {"merge": [], "semantic": []}
+def scripted(merge_replies, semantic_replies):
+    m, s = iter(merge_replies), iter(semantic_replies)
+    def _f(system, user, max_tokens):
+        if "THIS CLIP'S TERMS" in user:
+            prompts["merge"].append(user)
+            return next(m)
+        prompts["semantic"].append(user)
+        return next(s)
+    return _f
+
+good_merge = json.dumps({"merges": [
+    {"type": "place", "from": "sandy beach", "to": "The  Beach"},
+    {"type": "spaceship", "from": "x", "to": "y"},          # unknown type
+    {"type": "activity", "from": "not a term", "to": "z"},  # unknown from
+]})
+good_semantic = json.dumps({
+    "people": [{"name": " Man In  Red Cap ", "chunks": "0-2,3"}],
+    "threads": [{"name": "finding the lost drone", "chunks": "0-3"},
+                {"name": "", "chunks": "1"},                # no name
+                {"name": "ghost", "chunks": "50-60"}]})     # ids out of range
+
+ae._llm_text = scripted([good_merge], [good_semantic])
+ents, enriched = extractor.extract_clip(clip, {"place": ["the beach"]})
+by_key = {(e["type"], e["name"]): e for e in ents}
+check("merge renames onto canonical name",
+      by_key.get(("place", "the beach"), {}).get("chunk_ids") == list(range(8)))
+check("invalid merges ignored, seeds kept", ("activity", "swimming") in by_key)
+check("people/threads parsed from range strings",
+      by_key.get(("person", "man in red cap"), {}).get("chunk_ids") == [0, 1, 2, 3]
+      and ("thread", "finding the lost drone") in by_key)
+check("nameless/out-of-range semantic entities dropped",
+      ("thread", "ghost") not in by_key
+      and not any(t == "thread" and not n for t, n in by_key))
+check("good replies -> enriched", enriched is True)
+check("vocabulary appears in merge prompt", "the beach" in prompts["merge"][0])
+
+# 1d. truncated merge reply -> salvage, no retry
+truncated = ('{"merges": [{"type": "place", "from": "sandy beach", '
+             '"to": "the beach"}, {"type": "activity", "from": "swim')
+prompts["merge"].clear(); prompts["semantic"].clear()
+ae._llm_text = scripted([truncated], [good_semantic])
+ents2, enriched2 = extractor.extract_clip(clip, {"place": ["the beach"]})
+keys2 = {(e["type"], e["name"]) for e in ents2}
+check("truncated merge reply salvaged",
+      ("place", "the beach") in keys2 and enriched2 is True)
+check("salvage does not retry", len(prompts["merge"]) == 1)
+check("unmerged terms keep raw names", ("activity", "swimming") in keys2)
+
+# 1e. one self-retry with strictly less output pressure
+prompts["merge"].clear(); prompts["semantic"].clear()
+ae._llm_text = scripted(["total garbage", json.dumps({"merges": []})],
+                        ["also garbage", good_semantic])
+ents3, enriched3 = extractor.extract_clip(clip, {})
+check("merge retried once on garbage", len(prompts["merge"]) == 2)
+check("merge retry prompt is smaller",
+      len(prompts["merge"][1]) < len(prompts["merge"][0]))
+check("semantic retry prompt is smaller",
+      len(prompts["semantic"][1]) < len(prompts["semantic"][0]))
+check("retry success -> enriched", enriched3 is True)
+
+# 1f. both LLM calls fail -> seeds survive, marked unenriched
+ae._llm_text = fake_llm("garbage")
+ents4, enriched4 = extractor.extract_clip(clip, {})
+check("double LLM failure still returns seeds",
+      any(e["type"] == "place" for e in ents4))
+check("double LLM failure -> enriched False", enriched4 is False)
 
 # ---- 2. KnowledgeGraphStore persistence + fingerprints -------------------------
 store = ae.KnowledgeGraphStore()
@@ -161,21 +254,38 @@ check("wrong schema -> everything new",
       all(st == "new" for st in status3.values()))
 store.save(kg_path)  # restore good file
 
-# ---- 3. sync_knowledge_graph backfill ------------------------------------------
+# ---- 3. sync_knowledge_graph backfill + enrichment retry ------------------------
 sync_calls = []
 def sync_llm(system, user, max_tokens):
     sync_calls.append(user)
-    return json.dumps({"entities": [
-        {"type": "mood", "name": "golden hour", "chunk_ids": [7, 8]}]})
+    return json.dumps({"merges": [], "people": [], "threads": []})
 ae._llm_text = sync_llm
 store2, _ = ae.KnowledgeGraphStore.load(kg_path, pairs)
-ae.sync_knowledge_graph(store2, kg_path, lib, pairs)
-check("sync extracts only stale/missing clips", len(sync_calls) == 2)
+check("sync extracts only stale/missing clips (2 LLM calls each)",
+      (ae.sync_knowledge_graph(store2, kg_path, lib, pairs) or True)
+      and len(sync_calls) == 4)
 check("sync commits the new clips",
       all(store2.is_current(p) for p in pairs))
+check("sync marks clips enriched",
+      all(store2.is_enriched(p) for p in pairs))
 sync_calls.clear()
 ae.sync_knowledge_graph(store2, kg_path, lib, pairs)
 check("sync is a no-op when current", sync_calls == [])
+
+# a clip whose LLM calls all failed is committed unenriched and retried
+ae._llm_text = fake_llm("garbage")
+store2.commit_clip(pairs[2], [], enriched=False)
+ae.sync_knowledge_graph(store2, kg_path, lib, pairs)
+check("failed enrichment stays unenriched", not store2.is_enriched(pairs[2]))
+check("seeds still committed for unenriched clip",
+      len(store2.clip_entries[SOURCES[2]]["entities"]) > 0)
+sync_calls.clear()
+ae._llm_text = sync_llm
+ae.sync_knowledge_graph(store2, kg_path, lib, pairs)
+check("unenriched clip retried on next sync",
+      len(sync_calls) == 2 and store2.is_enriched(pairs[2]))
+check("enriched clips untouched by retry sync",
+      store2.is_enriched(pairs[0]) and store2.is_enriched(pairs[1]))
 
 # ---- 4. KnowledgeGraph build: merge, edges, chronology -------------------------
 store3 = ae.KnowledgeGraphStore()

@@ -71,15 +71,20 @@
       </section>
 
       <section id="tab-edl" class="tab">
-        <div class="row">
+        <div id="edl-toolbar">
           <h3 id="edl-title"></h3>
           <button id="btn-edl-save">Save as new version</button>
+          <span id="edl-sel-hint" class="hint"></span>
         </div>
-        <table id="edl-table">
-          <thead><tr><th></th><th>on</th><th>source</th><th>start</th><th>end</th><th>role / beat</th><th>summary</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <div id="edl-picker" class="hidden"></div>
+        <div id="edl-body">
+          <div id="edl-table-wrap">
+            <table id="edl-table">
+              <thead><tr><th></th><th></th><th>on</th><th>source</th><th>start</th><th>end</th><th>role / beat</th><th>summary</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <aside id="edl-picker" class="hidden"></aside>
+        </div>
       </section>
     </div>
     <div id="status-bar">

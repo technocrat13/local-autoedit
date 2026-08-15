@@ -97,11 +97,13 @@ TRANSCRIPT_DIGEST_CHARS = 200  # cap transcript length inside the composer diges
 
 LIBRARY_SCHEMA = 3  # v3 stores chunks per clip fingerprint (sticky analysis)
 
-# Knowledge graph: one LLM pass per clip extracts entities (people, places,
-# activities, objects, moods, narrative threads); cached per clip with the same
-# lrf_size fingerprint as the library, so it stays in sync and resumes.
-KG_SCHEMA = 1
-KG_MAX_TOKENS = 700
+# Knowledge graph: entity membership is derived deterministically from the
+# pass-1 chunk metadata; the LLM only merges near-duplicate names and spots
+# people/threads, so its replies stay tiny and cannot truncate mid-JSON.
+# Cached per clip with the same lrf_size fingerprint as the library.
+KG_SCHEMA = 2
+KG_MERGE_MAX_TOKENS = 350
+KG_ENTITY_MAX_TOKENS = 300
 ELEMENT_MAX_TOKENS = 500
 MAX_ELEMENTS = 12        # coverage units the graph composer weaves together
 MIN_AUTO_CUTS = 8
@@ -275,6 +277,36 @@ def salvage_selections(output_text):
         "story_title": title_match.group(1) if title_match else "",
         "selections": items,
     }
+
+
+def parse_id_ranges(spec, n):
+    """Compact id spec -> sorted clip-local ids clamped to 0..n-1.
+
+    Accepts "3-7,12" style strings (the KG prompt asks for these so replies
+    stay tiny) or a plain list of ints; garbage tokens are skipped."""
+    ids = set()
+    if isinstance(spec, (list, tuple)):
+        tokens = spec
+    else:
+        tokens = str(spec).split(",")
+    for token in tokens:
+        token = str(token).strip()
+        if not token:
+            continue
+        m = re.fullmatch(r"(-?\d+)\s*-\s*(-?\d+)", token)
+        try:
+            if m:
+                lo, hi = int(m.group(1)), int(m.group(2))
+                if lo > hi:
+                    lo, hi = hi, lo
+                ids.update(range(max(0, lo), min(n - 1, hi) + 1))
+            else:
+                cid = int(token)
+                if 0 <= cid < n:
+                    ids.add(cid)
+        except (TypeError, ValueError):
+            continue
+    return sorted(ids)
 
 
 # ----------------------------------------------------------------------------
@@ -499,7 +531,13 @@ def kg_normalize(name):
 
 
 class GraphExtractor:
-    """One bounded LLM call per clip: chunk digests in, entities out."""
+    """Per-clip entity extraction with tiny LLM replies.
+
+    Entity membership (the bulky data) is derived deterministically from the
+    pass-1 chunk metadata; the LLM only (1) merges near-duplicate names into
+    the day vocabulary and (2) names people/threads with compact id ranges.
+    Both replies are a handful of small objects, so they cannot blow through
+    the token budget the way full chunk_id arrays did."""
 
     SYSTEM = (
         "You are an archivist building a knowledge graph of one day of vlog "
@@ -507,64 +545,232 @@ class GraphExtractor:
         "never use markdown."
     )
 
-    def extract_clip(self, chunks, vocabulary):
-        """chunks: this clip's chunks in order. vocabulary: {type: [names]} of
-        entities already known from other clips. Returns validated entity list
-        with clip-local chunk_ids."""
-        if not chunks:
-            return []
-        lines = [f"id={i} " + StoryComposer._digest_line(c).split("] ", 1)[-1]
-                 for i, c in enumerate(chunks)]
-        known = "\n".join(f"{t}: {', '.join(names)}"
-                          for t, names in vocabulary.items() if names) or "none yet"
-        user = (
-            "Below are the analyzed shots of ONE video clip, in order. Extract "
-            "the entities this clip shows so the day's knowledge graph can be "
-            "assembled across clips.\n"
-            "Rules:\n"
-            f"- Entity types: {', '.join(KG_ENTITY_TYPES)}. A 'thread' is an "
-            "ongoing storyline or recurring situation (e.g. 'finding the lost "
-            "drone').\n"
-            "- Reuse the EXACT name of a known entity when this clip shows the "
-            "same person/place/thing; only invent a new name for genuinely new "
-            "entities.\n"
-            "- Names are short lowercase phrases (1-4 words). List every shot id "
-            "where the entity appears.\n"
-            'Output ONLY a JSON object: {"entities": [list of objects, each with '
-            '"type", "name", and "chunk_ids" (list of id numbers from below)]}.\n\n'
-            f"KNOWN ENTITIES (reuse these exact names when they match):\n{known}\n\n"
-            f"SHOTS:\n" + "\n".join(lines)
-        )
+    # per-type caps for deterministic seeds (place is never capped)
+    SEED_CAPS = {"activity": 10, "object": 8, "mood": 5}
+
+    @staticmethod
+    def _seed_terms(chunks):
+        """{(type, name): set(clip_local_ids)} straight from pass-1 fields -
+        no LLM involved, so an analyzed clip always has graph entries."""
+        terms = {}
+
+        def note(etype, raw, idx):
+            name = kg_normalize(raw)
+            if name and name != "unknown":
+                terms.setdefault((etype, name), set()).add(idx)
+
+        for i, chunk in enumerate(chunks):
+            note("place", chunk.get("scene", ""), i)
+            for action in chunk.get("actions") or []:
+                note("activity", action, i)
+            for tag in chunk.get("visual_tags") or []:
+                note("object", tag, i)
+            for emotion in chunk.get("emotions") or []:
+                note("mood", emotion, i)
+
+        min_chunks = 1 if len(chunks) < 6 else 2
+        terms = {k: v for k, v in terms.items() if len(v) >= min_chunks}
+        for etype, cap in GraphExtractor.SEED_CAPS.items():
+            typed = sorted((k for k in terms if k[0] == etype),
+                           key=lambda k: (-len(terms[k]), k[1]))
+            for key in typed[cap:]:
+                del terms[key]
+        return terms
+
+    @staticmethod
+    def _salvage_merges(output_text):
+        items = []
+        for match in re.finditer(r"\{[^{}]*\"from\"[^{}]*\}", output_text, re.DOTALL):
+            try:
+                item = json.loads(match.group(0))
+            except Exception:
+                continue
+            if isinstance(item, dict) and "from" in item:
+                items.append(item)
+        return {"merges": items} if items else None
+
+    @staticmethod
+    def _salvage_semantic(output_text):
+        items = []
+        for match in re.finditer(r"\{[^{}]*\"chunks\"[^{}]*\}", output_text, re.DOTALL):
+            try:
+                item = json.loads(match.group(0))
+            except Exception:
+                continue
+            if isinstance(item, dict) and "chunks" in item:
+                items.append((match.start(), item))
+        if not items:
+            return None
+        # objects after the "threads" key belong to the threads list
+        threads_at = output_text.find('"threads"')
+        people, threads = [], []
+        for pos, item in items:
+            if threads_at != -1 and pos > threads_at:
+                threads.append(item)
+            else:
+                people.append(item)
+        return {"people": people, "threads": threads}
+
+    def _ask(self, user, max_tokens, salvage):
+        """One LLM call -> parsed dict, trying the salvager before giving up."""
         try:
-            parsed = parse_json_response(_llm_text(self.SYSTEM, user, KG_MAX_TOKENS))
+            raw = _llm_text(self.SYSTEM, user, max_tokens)
         except Exception as e:
             print(f"  graph extraction call failed: {e}")
-            return []
-        entities = []
-        seen = set()
-        if isinstance(parsed, dict) and isinstance(parsed.get("entities"), list):
-            for item in parsed["entities"]:
+            return None
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        try:
+            parsed = json.loads(clean)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        salvaged = salvage(raw)
+        if salvaged is not None:
+            return salvaged
+        print(f"Formatting warning. Raw text was: {raw}")
+        return None
+
+    def _canonicalize(self, terms, vocabulary):
+        """LLM call 1: merge near-duplicate term names (tiny output - only the
+        merges themselves). Returns (merged_terms, ok)."""
+        if not terms:
+            return {}, True
+        known = "\n".join(f"{t}: {', '.join(names)}"
+                          for t, names in vocabulary.items() if names) or "none yet"
+
+        def term_lines(keys):
+            by_type = {}
+            for etype, name in keys:
+                by_type.setdefault(etype, []).append(name)
+            return "\n".join(f"{t}: {', '.join(sorted(names))}"
+                             for t, names in sorted(by_type.items()))
+
+        def prompt(keys):
+            return (
+                "Below are entity terms detected in ONE video clip, plus the "
+                "names already known from other clips of the same day. Merge "
+                "near-duplicate names so the day's graph uses one canonical "
+                "name per real-world entity (e.g. 'sandy beach' -> 'the "
+                "beach').\n"
+                "Rules:\n"
+                "- Only output merges. A term without a merge keeps its name.\n"
+                "- 'to' should be a KNOWN name when the term means the same "
+                "thing; otherwise a cleaner short lowercase name.\n"
+                "- Do not merge terms that mean different things. No merges "
+                "is a fine answer.\n"
+                'Output ONLY a JSON object: {"merges": [{"type", "from", '
+                '"to"}, ...]} (empty list if nothing to merge).\n\n'
+                f"KNOWN NAMES:\n{known}\n\n"
+                f"THIS CLIP'S TERMS:\n{term_lines(keys)}"
+            )
+
+        parsed = self._ask(prompt(list(terms)), KG_MERGE_MAX_TOKENS,
+                           self._salvage_merges)
+        if parsed is None:
+            # retry once with strictly less output pressure: only the biggest
+            # half of the terms are offered for merging
+            top = sorted(terms, key=lambda k: -len(terms[k]))
+            top = top[:max(1, len(top) // 2)]
+            parsed = self._ask(prompt(top), KG_MERGE_MAX_TOKENS,
+                               self._salvage_merges)
+        ok = parsed is not None
+
+        merged = {}
+        renames = {}
+        if ok:
+            for item in parsed.get("merges") or []:
                 if not isinstance(item, dict):
                     continue
                 etype = str(item.get("type", "")).strip().lower()
-                name = kg_normalize(item.get("name", ""))
-                if etype not in KG_ENTITY_TYPES or not name:
-                    continue
-                ids = []
-                for cid in item.get("chunk_ids") or []:
-                    try:
-                        cid = int(cid)
-                    except (TypeError, ValueError):
+                src = kg_normalize(item.get("from", ""))
+                dst = kg_normalize(item.get("to", ""))
+                if etype in KG_ENTITY_TYPES and dst and (etype, src) in terms:
+                    renames[(etype, src)] = (etype, dst)
+        for key, ids in terms.items():
+            target = renames.get(key, key)
+            merged.setdefault(target, set()).update(ids)
+        return merged, ok
+
+    def _semantic_entities(self, chunks, vocabulary):
+        """LLM call 2: people + threads from summaries/transcripts, with
+        compact range strings for membership. Returns (entities, ok)."""
+        known = [n for t in ("person", "thread") for n in vocabulary.get(t, [])]
+        known_part = ", ".join(known) or "none yet"
+
+        def prompt(char_cap, people_cap, thread_cap):
+            lines = []
+            for i, c in enumerate(chunks):
+                speech = c.get("speech", {}).get("transcript", "")
+                line = f"id={i} {c.get('one_line_summary', '')[:char_cap]}"
+                if speech:
+                    line += f' says:"{speech[:char_cap]}"'
+                lines.append(line)
+            return (
+                "Below are the shots of ONE video clip, in order. Identify "
+                "recurring PEOPLE and story THREADS (an ongoing storyline, "
+                "e.g. 'finding the lost drone').\n"
+                "Rules:\n"
+                f"- At most {people_cap} people and {thread_cap} threads; only "
+                "recurring/nameable ones. Empty lists are a fine answer.\n"
+                "- Reuse a KNOWN name when it is the same person/thread.\n"
+                "- Names are short lowercase phrases (1-4 words).\n"
+                "- 'chunks' is a compact id spec like \"3-7,12\" - ranges and "
+                "single ids, no spaces.\n"
+                'Output ONLY a JSON object: {"people": [{"name", "chunks"}], '
+                '"threads": [{"name", "chunks"}]}.\n\n'
+                f"KNOWN NAMES: {known_part}\n\n"
+                "SHOTS:\n" + "\n".join(lines)
+            )
+
+        parsed = self._ask(prompt(200, 4, 2), KG_ENTITY_MAX_TOKENS,
+                           self._salvage_semantic)
+        if parsed is None:
+            parsed = self._ask(prompt(60, 2, 1), KG_ENTITY_MAX_TOKENS,
+                               self._salvage_semantic)
+        ok = parsed is not None
+
+        entities = []
+        if ok:
+            for etype, group in (("person", "people"), ("thread", "threads")):
+                for item in parsed.get(group) or []:
+                    if not isinstance(item, dict):
                         continue
-                    if 0 <= cid < len(chunks):
-                        ids.append(cid)
-                key = (etype, name)
-                if not ids or key in seen:
-                    continue
-                seen.add(key)
-                entities.append({"type": etype, "name": name,
-                                 "chunk_ids": sorted(set(ids))})
-        return entities
+                    name = kg_normalize(item.get("name", ""))
+                    ids = parse_id_ranges(item.get("chunks", ""), len(chunks))
+                    if name and ids:
+                        entities.append({"type": etype, "name": name,
+                                         "chunk_ids": ids})
+        return entities, ok
+
+    def extract_clip(self, chunks, vocabulary):
+        """chunks: this clip's chunks in order. vocabulary: {type: [names]} of
+        entities already known from other clips. Returns (entities, enriched):
+        the validated entity list with clip-local chunk_ids, and whether both
+        LLM calls produced usable output (False -> retried on next sync)."""
+        if not chunks:
+            return [], True
+        vocabulary = vocabulary or {}
+        seeds = self._seed_terms(chunks)
+        merged, merge_ok = self._canonicalize(seeds, vocabulary)
+        semantic, semantic_ok = self._semantic_entities(chunks, vocabulary)
+
+        entities = []
+        seen = set()
+        for (etype, name), ids in merged.items():
+            key = (etype, name)
+            if key in seen or not ids:
+                continue
+            seen.add(key)
+            entities.append({"type": etype, "name": name,
+                             "chunk_ids": sorted(ids)})
+        for ent in semantic:
+            key = (ent["type"], ent["name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(ent)
+        return entities, merge_ok and semantic_ok
 
 
 class KnowledgeGraphStore:
@@ -572,19 +778,24 @@ class KnowledgeGraphStore:
     same lrf_size fingerprint, so graph knowledge is sticky and resumes."""
 
     def __init__(self):
-        self.clip_entries = {}  # source -> {"lrf_name", "lrf_size", "entities"}
+        self.clip_entries = {}  # source -> {"lrf_name", "lrf_size", "entities", "enriched"}
 
-    def commit_clip(self, pair, entities):
+    def commit_clip(self, pair, entities, enriched=True):
         source = os.path.basename(pair["hires"])
         self.clip_entries[source] = {
             "lrf_name": os.path.basename(pair["lrf"]),
             "lrf_size": ChunkLibrary.clip_fingerprint(pair),
             "entities": entities,
+            "enriched": bool(enriched),
         }
 
     def is_current(self, pair):
         entry = self.clip_entries.get(os.path.basename(pair["hires"]))
         return bool(entry) and entry.get("lrf_size") == ChunkLibrary.clip_fingerprint(pair)
+
+    def is_enriched(self, pair):
+        entry = self.clip_entries.get(os.path.basename(pair["hires"]))
+        return bool(entry) and bool(entry.get("enriched"))
 
     def vocabulary(self):
         """{type: [names]} of everything known so far, for prompt reuse."""
@@ -1753,9 +1964,10 @@ def analyze_clip(pair, preprocessor, analyzer, transcriber, library, workdir, ma
 
 
 def sync_knowledge_graph(store, kg_path, library, pairs):
-    """Extract entities for every clip whose KG entry is missing or stale,
-    from the already-cached chunks (no video re-analysis). Saves after each
-    clip so an interrupted run resumes."""
+    """Extract entities for every clip whose KG entry is missing, stale, or
+    was committed without usable LLM output (enriched=False), from the
+    already-cached chunks (no video re-analysis). Saves after each clip so an
+    interrupted run resumes."""
     by_clip = {}
     for chunk in library.chunks:
         by_clip.setdefault(chunk["source"], []).append(chunk)
@@ -1763,13 +1975,14 @@ def sync_knowledge_graph(store, kg_path, library, pairs):
     for pair in pairs:
         source = os.path.basename(pair["hires"])
         clip_chunks = by_clip.get(source)
-        if not clip_chunks or store.is_current(pair):
+        if not clip_chunks or (store.is_current(pair) and store.is_enriched(pair)):
             continue
         if extractor is None:
             extractor = GraphExtractor()
-        entities = extractor.extract_clip(clip_chunks, store.vocabulary())
-        print(f"Knowledge graph: {source} -> {len(entities)} entities")
-        store.commit_clip(pair, entities)
+        entities, enriched = extractor.extract_clip(clip_chunks, store.vocabulary())
+        print(f"Knowledge graph: {source} -> {len(entities)} entities"
+              + ("" if enriched else " (LLM naming failed - will retry next sync)"))
+        store.commit_clip(pair, entities, enriched=enriched)
         store.save(kg_path)
 
 
