@@ -1,7 +1,8 @@
 """Stubbed sanity test for the knowledge graph layer (runs on macOS, no GPU /
-heavy deps needed): GraphExtractor validation, KnowledgeGraphStore persistence
-and fingerprint invalidation, KnowledgeGraph build/subgraph/elements_of_day,
-and compose_with_graph auto cut counts + fallback."""
+heavy deps needed): GraphExtractor validation (seeds, clip-level themes/places,
+scene-seed folding, salvage, retry), KnowledgeGraphStore persistence and
+fingerprint invalidation, KnowledgeGraph build/subgraph/elements_of_day with
+object/mood demotion, and compose_with_graph auto cut counts + fallback."""
 import os
 import sys
 import json
@@ -161,6 +162,8 @@ good_merge = json.dumps({"merges": [
     {"type": "activity", "from": "not a term", "to": "z"},  # unknown from
 ]})
 good_semantic = json.dumps({
+    "themes": [{"name": "Hunt For The  Lost Drone", "chunks": "junk"}],  # bad ids
+    "places": [{"name": "the beach", "chunks": "0-7"}],
     "people": [{"name": " Man In  Red Cap ", "chunks": "0-2,3"}],
     "threads": [{"name": "finding the lost drone", "chunks": "0-3"},
                 {"name": "", "chunks": "1"},                # no name
@@ -172,6 +175,9 @@ by_key = {(e["type"], e["name"]): e for e in ents}
 check("merge renames onto canonical name",
       by_key.get(("place", "the beach"), {}).get("chunk_ids") == list(range(8)))
 check("invalid merges ignored, seeds kept", ("activity", "swimming") in by_key)
+check("theme with garbage chunk spec spans whole clip",
+      by_key.get(("theme", "hunt for the lost drone"), {}).get("chunk_ids")
+      == list(range(8)))
 check("people/threads parsed from range strings",
       by_key.get(("person", "man in red cap"), {}).get("chunk_ids") == [0, 1, 2, 3]
       and ("thread", "finding the lost drone") in by_key)
@@ -180,6 +186,39 @@ check("nameless/out-of-range semantic entities dropped",
       and not any(t == "thread" and not n for t, n in by_key))
 check("good replies -> enriched", enriched is True)
 check("vocabulary appears in merge prompt", "the beach" in prompts["merge"][0])
+
+# 1c-bis. clip-level places fold fragmented scene seeds
+kart_clip = ([mk(i, scene="racetrack") for i in range(6)]
+             + [mk(i, scene="paddock") for i in range(6, 10)])
+fold_semantic = json.dumps({
+    "themes": [{"name": "go karting day", "chunks": "0-9"}],
+    "places": [{"name": "go kart track", "chunks": "0-5"}],
+    "people": [], "threads": []})
+ae._llm_text = scripted([json.dumps({"merges": []})], [fold_semantic])
+fents, _ = extractor.extract_clip(kart_clip, {})
+fkeys = {(e["type"], e["name"]): e for e in fents}
+check("covered scene seed folds into clip place",
+      ("place", "racetrack") not in fkeys
+      and fkeys.get(("place", "go kart track"), {}).get("chunk_ids") == [0, 1, 2, 3, 4, 5])
+check("uncovered scene seed keeps its remaining ids",
+      fkeys.get(("place", "paddock"), {}).get("chunk_ids") == [6, 7, 8, 9])
+check("theme entity carried through", ("theme", "go karting day") in fkeys)
+
+# 1c-ter. semantic salvage classifies objects by nearest preceding group key
+trunc_sem = ('{"themes": [{"name": "go karting day", "chunks": "0-9"}], '
+             '"people": [{"name": "man in red cap", "chunks": "2-4"}, '
+             '{"name": "pit crew", "chunks": "5')
+salv = ae.GraphExtractor._salvage_semantic(trunc_sem)
+check("salvage assigns objects to nearest preceding group",
+      salv["themes"][0]["name"] == "go karting day"
+      and [p["name"] for p in salv["people"]] == ["man in red cap"]
+      and salv["places"] == [] and salv["threads"] == [])
+orphan = ('{"name": "go karting", "chunks": "0-9"} "people": ['
+          '{"name": "driver", "chunks": "1-3"}]')
+salv2 = ae.GraphExtractor._salvage_semantic(orphan)
+check("salvage puts objects before any key into themes",
+      salv2["themes"][0]["name"] == "go karting"
+      and salv2["people"][0]["name"] == "driver")
 
 # 1d. truncated merge reply -> salvage, no retry
 truncated = ('{"merges": [{"type": "place", "from": "sandy beach", '
@@ -246,11 +285,11 @@ check("changed lrf invalidates only that clip",
 
 with open(kg_path, "r", encoding="utf-8") as f:
     payload = json.load(f)
-payload["schema"] = 99
+payload["schema"] = 2  # pre-theme schema is rebuilt from scratch
 with open(kg_path, "w", encoding="utf-8") as f:
     json.dump(payload, f)
 _, status3 = ae.KnowledgeGraphStore.load(kg_path, pairs)
-check("wrong schema -> everything new",
+check("old schema -> everything new",
       all(st == "new" for st in status3.values()))
 store.save(kg_path)  # restore good file
 
@@ -258,7 +297,8 @@ store.save(kg_path)  # restore good file
 sync_calls = []
 def sync_llm(system, user, max_tokens):
     sync_calls.append(user)
-    return json.dumps({"merges": [], "people": [], "threads": []})
+    return json.dumps({"merges": [], "themes": [], "places": [],
+                       "people": [], "threads": []})
 ae._llm_text = sync_llm
 store2, _ = ae.KnowledgeGraphStore.load(kg_path, pairs)
 check("sync extracts only stale/missing clips (2 LLM calls each)",
@@ -290,6 +330,7 @@ check("enriched clips untouched by retry sync",
 # ---- 4. KnowledgeGraph build: merge, edges, chronology -------------------------
 store3 = ae.KnowledgeGraphStore()
 store3.commit_clip(pairs[0], [
+    {"type": "theme", "name": "beach day", "chunk_ids": [0, 1, 2]},
     {"type": "place", "name": "the beach", "chunk_ids": [1, 0]},
     {"type": "person", "name": "man in red cap", "chunk_ids": [0, 3]},
     {"type": "thread", "name": "finding the lost drone", "chunk_ids": [3, 5]},
@@ -327,10 +368,17 @@ check("removed clip drops from graph",
 # ---- 5. elements_of_day + subgraph ---------------------------------------------
 elements = graph.elements_of_day()
 keys = [e["key"] for e in elements]
-check("threads outrank places",
-      keys.index("thread:finding the lost drone") < keys.index("place:the beach"))
-check("all substantial entities covered",
-      {"place:the beach", "activity:swimming", "mood:golden hour"} <= set(keys))
+check("themes outrank threads outrank places",
+      keys.index("theme:beach day")
+      < keys.index("thread:finding the lost drone")
+      < keys.index("place:the beach"))
+check("all substantial element-type entities covered",
+      {"place:the beach", "activity:swimming"} <= set(keys))
+check("object/mood demoted out of elements",
+      "mood:golden hour" not in keys
+      and not any(k.split(":")[0] in ("object", "mood") for k in keys))
+check("demoted types stay in the graph for retrieval",
+      "mood:golden hour" in graph.entities)
 
 dup_store = ae.KnowledgeGraphStore()
 dup_store.commit_clip(pairs[0], [
@@ -376,6 +424,20 @@ check("graph compose returns selections", len(sels) >= ae.MIN_AUTO_CUTS // 2)
 srt = sorted(sels, key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
 check("graph compose chronological", sels == srt)
 check("selections carry element beats", all(s.get("beat") for s in sels))
+check("theme element becomes a beat",
+      any(s.get("beat") == "beach day" for s in sels))
+check("demoted types never become beats",
+      not any(s.get("beat") == "golden hour" for s in sels))
+
+ae._llm_text = element_llm
+sels_must = composer.compose_with_graph(
+    lib, story, graph, must_include=["mood:golden hour", "bogus:nope"])
+check("must_include forces a demoted entity into the beats",
+      any(s.get("beat") == "golden hour" for s in sels_must))
+check("unknown must_include keys ignored",
+      not any(s.get("beat") == "nope" for s in sels_must))
+srt_must = sorted(sels_must, key=lambda s: (s["chunk"]["source"], s["chunk"]["start"]))
+check("must_include keeps chronology", sels_must == srt_must)
 ids = [s["chunk"]["library_id"] for s in sels]
 check("no duplicate chunks", len(ids) == len(set(ids)))
 first = min(lib.chunks, key=lambda c: (c["source"], c["start"]))

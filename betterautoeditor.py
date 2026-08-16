@@ -101,9 +101,9 @@ LIBRARY_SCHEMA = 3  # v3 stores chunks per clip fingerprint (sticky analysis)
 # pass-1 chunk metadata; the LLM only merges near-duplicate names and spots
 # people/threads, so its replies stay tiny and cannot truncate mid-JSON.
 # Cached per clip with the same lrf_size fingerprint as the library.
-KG_SCHEMA = 2
+KG_SCHEMA = 3
 KG_MERGE_MAX_TOKENS = 350
-KG_ENTITY_MAX_TOKENS = 300
+KG_ENTITY_MAX_TOKENS = 350
 ELEMENT_MAX_TOKENS = 500
 MAX_ELEMENTS = 12        # coverage units the graph composer weaves together
 MIN_AUTO_CUTS = 8
@@ -520,10 +520,13 @@ class ChunkLibrary:
 # ----------------------------------------------------------------------------
 # Knowledge graph - entities per clip (LLM pass), derived edges, coverage units
 # ----------------------------------------------------------------------------
-KG_ENTITY_TYPES = ("person", "place", "activity", "object", "mood", "thread")
-# priority when choosing the day's coverage units (threads/story first)
-KG_TYPE_PRIORITY = {"thread": 0, "place": 1, "activity": 2,
-                    "person": 3, "object": 4, "mood": 5}
+KG_ENTITY_TYPES = ("theme", "person", "place", "activity", "object", "mood", "thread")
+# priority when choosing the day's coverage units (clip subjects/story first)
+KG_TYPE_PRIORITY = {"theme": 0, "thread": 1, "place": 2, "activity": 3,
+                    "person": 4, "object": 5, "mood": 6}
+# only these types can become composition beats; object/mood stay in the
+# graph as retrieval detail but would flood the story with shot-level noise
+KG_ELEMENT_TYPES = ("theme", "thread", "place", "activity", "person")
 
 
 def kg_normalize(name):
@@ -589,6 +592,10 @@ class GraphExtractor:
                 items.append(item)
         return {"merges": items} if items else None
 
+    # clip-entity reply groups, in prompt/output order
+    CLIP_GROUPS = (("theme", "themes"), ("place", "places"),
+                   ("person", "people"), ("thread", "threads"))
+
     @staticmethod
     def _salvage_semantic(output_text):
         items = []
@@ -601,15 +608,20 @@ class GraphExtractor:
                 items.append((match.start(), item))
         if not items:
             return None
-        # objects after the "threads" key belong to the threads list
-        threads_at = output_text.find('"threads"')
-        people, threads = [], []
+        # assign each salvaged object to the nearest preceding group key;
+        # objects before any key belong to the first group (themes)
+        key_positions = sorted(
+            (pos, group) for _, group in GraphExtractor.CLIP_GROUPS
+            if (pos := output_text.find(f'"{group}"')) != -1)
+        result = {group: [] for _, group in GraphExtractor.CLIP_GROUPS}
+        first_group = GraphExtractor.CLIP_GROUPS[0][1]
         for pos, item in items:
-            if threads_at != -1 and pos > threads_at:
-                threads.append(item)
-            else:
-                people.append(item)
-        return {"people": people, "threads": threads}
+            group = first_group
+            for kpos, kgroup in key_positions:
+                if kpos < pos:
+                    group = kgroup
+            result[group].append(item)
+        return result
 
     def _ask(self, user, max_tokens, salvage):
         """One LLM call -> parsed dict, trying the salvager before giving up."""
@@ -692,13 +704,15 @@ class GraphExtractor:
             merged.setdefault(target, set()).update(ids)
         return merged, ok
 
-    def _semantic_entities(self, chunks, vocabulary):
-        """LLM call 2: people + threads from summaries/transcripts, with
-        compact range strings for membership. Returns (entities, ok)."""
-        known = [n for t in ("person", "thread") for n in vocabulary.get(t, [])]
+    def _clip_entities(self, chunks, vocabulary):
+        """LLM call 2: what the clip is ABOUT - themes, overall places,
+        recurring people, story threads - with compact range strings for
+        membership. Returns (entities, ok)."""
+        known = [n for t in ("theme", "place", "person", "thread")
+                 for n in vocabulary.get(t, [])]
         known_part = ", ".join(known) or "none yet"
 
-        def prompt(char_cap, people_cap, thread_cap):
+        def prompt(char_cap, theme_cap, place_cap, people_cap, thread_cap):
             lines = []
             for i, c in enumerate(chunks):
                 speech = c.get("speech", {}).get("transcript", "")
@@ -707,37 +721,45 @@ class GraphExtractor:
                     line += f' says:"{speech[:char_cap]}"'
                 lines.append(line)
             return (
-                "Below are the shots of ONE video clip, in order. Identify "
-                "recurring PEOPLE and story THREADS (an ongoing storyline, "
-                "e.g. 'finding the lost drone').\n"
+                "Below are the shots of ONE video clip, in order. Step back "
+                "and describe the clip as a whole:\n"
+                f"- THEMES: {theme_cap} phrase(s) naming what this clip is "
+                "ABOUT as a whole (the central subject or event, e.g. 'go "
+                "karting at the kart track'), not shot-level detail.\n"
+                f"- PLACES: the {place_cap} real location(s) of the clip, one "
+                "canonical name each (e.g. 'go kart track').\n"
+                f"- PEOPLE (at most {people_cap}) and story THREADS (at most "
+                f"{thread_cap}, an ongoing storyline e.g. 'race for the "
+                "fastest lap'); only recurring/nameable ones. Empty lists "
+                "are a fine answer.\n"
                 "Rules:\n"
-                f"- At most {people_cap} people and {thread_cap} threads; only "
-                "recurring/nameable ones. Empty lists are a fine answer.\n"
-                "- Reuse a KNOWN name when it is the same person/thread.\n"
-                "- Names are short lowercase phrases (1-4 words).\n"
+                "- Reuse a KNOWN name when it is the same thing.\n"
+                "- Names are short lowercase phrases (1-5 words).\n"
                 "- 'chunks' is a compact id spec like \"3-7,12\" - ranges and "
                 "single ids, no spaces.\n"
-                'Output ONLY a JSON object: {"people": [{"name", "chunks"}], '
-                '"threads": [{"name", "chunks"}]}.\n\n'
+                'Output ONLY a JSON object: {"themes": [{"name", "chunks"}], '
+                '"places": [...], "people": [...], "threads": [...]}.\n\n'
                 f"KNOWN NAMES: {known_part}\n\n"
                 "SHOTS:\n" + "\n".join(lines)
             )
 
-        parsed = self._ask(prompt(200, 4, 2), KG_ENTITY_MAX_TOKENS,
-                           self._salvage_semantic)
+        parsed = self._ask(prompt(200, "1-2", "1-2", 4, 2),
+                           KG_ENTITY_MAX_TOKENS, self._salvage_semantic)
         if parsed is None:
-            parsed = self._ask(prompt(60, 2, 1), KG_ENTITY_MAX_TOKENS,
-                               self._salvage_semantic)
+            parsed = self._ask(prompt(60, 1, 1, 2, 1),
+                               KG_ENTITY_MAX_TOKENS, self._salvage_semantic)
         ok = parsed is not None
 
         entities = []
         if ok:
-            for etype, group in (("person", "people"), ("thread", "threads")):
+            for etype, group in self.CLIP_GROUPS:
                 for item in parsed.get(group) or []:
                     if not isinstance(item, dict):
                         continue
                     name = kg_normalize(item.get("name", ""))
                     ids = parse_id_ranges(item.get("chunks", ""), len(chunks))
+                    if etype == "theme" and name and not ids:
+                        ids = list(range(len(chunks)))  # themes span the clip
                     if name and ids:
                         entities.append({"type": etype, "name": name,
                                          "chunk_ids": ids})
@@ -753,22 +775,40 @@ class GraphExtractor:
         vocabulary = vocabulary or {}
         seeds = self._seed_terms(chunks)
         merged, merge_ok = self._canonicalize(seeds, vocabulary)
-        semantic, semantic_ok = self._semantic_entities(chunks, vocabulary)
+        semantic, semantic_ok = self._clip_entities(chunks, vocabulary)
+
+        # fold fragmented per-chunk scene seeds into the LLM's clip-level
+        # places: a seed loses the ids a clip place already covers, so
+        # "racetrack"/"asphalt track" fragments vanish while a genuinely
+        # different location keeps its remaining ids
+        llm_place_ids = set()
+        for ent in semantic:
+            if ent["type"] == "place":
+                llm_place_ids.update(ent["chunk_ids"])
+        if llm_place_ids:
+            for key in [k for k in merged if k[0] == "place"]:
+                remaining = merged[key] - llm_place_ids
+                if remaining:
+                    merged[key] = remaining
+                else:
+                    del merged[key]
 
         entities = []
-        seen = set()
+        seen = {}
         for (etype, name), ids in merged.items():
-            key = (etype, name)
-            if key in seen or not ids:
+            if not ids:
                 continue
-            seen.add(key)
+            seen[(etype, name)] = len(entities)
             entities.append({"type": etype, "name": name,
                              "chunk_ids": sorted(ids)})
         for ent in semantic:
             key = (ent["type"], ent["name"])
-            if key in seen:
+            if key in seen:  # LLM entry wins: union ids into the seed
+                prior = entities[seen[key]]
+                prior["chunk_ids"] = sorted(set(prior["chunk_ids"])
+                                            | set(ent["chunk_ids"]))
                 continue
-            seen.add(key)
+            seen[key] = len(entities)
             entities.append(ent)
         return entities, merge_ok and semantic_ok
 
@@ -898,10 +938,12 @@ class KnowledgeGraph:
         return graph
 
     def elements_of_day(self, max_elements=MAX_ELEMENTS):
-        """The day's coverage units: the most substantial entities, story
-        threads first, each with its chunks in chronological order."""
+        """The day's coverage units: the most substantial entities, clip
+        themes and story threads first, each with its chunks in chronological
+        order. Detail types (object/mood) stay out - they are retrieval
+        hooks, not story beats."""
         nodes = sorted(
-            self.entities.values(),
+            (n for n in self.entities.values() if n["type"] in KG_ELEMENT_TYPES),
             key=lambda n: (KG_TYPE_PRIORITY[n["type"]], -len(n["chunk_ids"])))
         picked, covered = [], set()
         for node in nodes:
@@ -1440,12 +1482,14 @@ class StoryComposer:
         return picks[:beat["target_shots"] + 2]
 
     def compose_with_graph(self, library, story, graph, target_len=None,
-                           margin=3.0, max_total=None):
+                           margin=3.0, max_total=None, must_include=None):
         """Coverage-driven composition: the knowledge graph's elements of the
         day are the beats; each element gets a small bounded LLM call over its
         own chunks. Cut count emerges from coverage (optionally scaled to an
-        approximate target length in seconds). Returns [] if the graph is
-        unusable so callers can fall back to the legacy compose path."""
+        approximate target length in seconds). Entities named in must_include
+        (graph keys like "activity:go karting") are forced into the beat list
+        even when the coverage filter would skip them. Returns [] if the graph
+        is unusable so callers can fall back to the legacy compose path."""
         if not library.chunks:
             return []
         # ---- auto cut count ---------------------------------------------------
@@ -1456,6 +1500,13 @@ class StoryComposer:
         max_elements = MAX_ELEMENTS if not target_total else \
             max(MAX_ELEMENTS, min(2 * MAX_ELEMENTS, target_total // 3))
         elements = graph.elements_of_day(max_elements)
+        must_keys = [k for k in (must_include or []) if k in graph.entities]
+        have = {el["key"] for el in elements}
+        for key in must_keys:
+            if key not in have:
+                elements.append(graph.entities[key])
+                have.add(key)
+        must_set = set(must_keys)
         if not elements:
             return []
         order = {c["library_id"]: (c["source"], c["start"]) for c in library.chunks}
@@ -1465,6 +1516,8 @@ class StoryComposer:
         avoided = [kg_normalize(a) for a in story.get("avoid") or []]
 
         def brief_bias(el):
+            if el["key"] in must_set:  # user ticked it - never fade, always boost
+                return 2.0
             name = el["name"]
             if any(a and (a in name or name in a) for a in avoided):
                 return 0.3
@@ -1489,8 +1542,9 @@ class StoryComposer:
               + (f", targeting ~{target_len:.0f}s" if target_len else ", auto")
               + ")...")
         for el, q in zip(elements, quotas):
+            forced = " (must include)" if el["key"] in must_set else ""
             print(f"  [{el['type']:>8}] {el['name']} "
-                  f"({len(el['chunk_ids'])} chunks, ~{q} cuts)")
+                  f"({len(el['chunk_ids'])} chunks, ~{q} cuts){forced}")
 
         by_id = {c["library_id"]: c for c in library.chunks}
         selections, seen, prior_lines = [], set(), []

@@ -6,6 +6,8 @@ const state = {
   browsePath: window.ROOT,
   project: null,          // { project, name, pairs, library, versions }
   selectedSources: new Set(),
+  coverage: null,         // graph entities offered as compose checkboxes
+  mustInclude: new Set(), // ticked entity keys - guaranteed story beats
   edl: null,              // { version, cuts: [{cut, enabled, added}], allChunks }
   picker: null,           // { mode: "insert"|"section", gap, showAll, checked, reasons, aiStatus }
   section: null,          // { a: idx, b: idx|null } - recreate-section anchors
@@ -91,6 +93,7 @@ async function openProject(path) {
   showTab("clips");
   renderVersions();
   await renderClips();
+  loadCoverage();
   refreshHistory();
 }
 
@@ -134,6 +137,57 @@ function renderChips() {
     ? "Composing from: " + names.map((n) => `<span class="chip">${esc(n)}</span>`).join(" ")
     : "Composing from: <em>all clips</em>";
 }
+
+// ---------------------------------------------------------------------------
+// Compose coverage checklist - graph entities the edit must not miss
+// ---------------------------------------------------------------------------
+const COVERAGE_TYPES = ["theme", "thread", "place", "activity", "person"];
+
+async function loadCoverage() {
+  state.coverage = null;
+  state.mustInclude = new Set();
+  try {
+    const data = await api(`/api/project/graph?path=${encodeURIComponent(state.project.project)}`);
+    state.coverage = data.nodes
+      .filter((n) => COVERAGE_TYPES.includes(n.type))
+      .sort((a, b) => COVERAGE_TYPES.indexOf(a.type) - COVERAGE_TYPES.indexOf(b.type)
+        || b.chunk_count - a.chunk_count);
+  } catch (e) {
+    state.coverage = null;
+  }
+  renderCoverage();
+}
+
+function renderCoverage() {
+  const box = $("#compose-coverage");
+  const list = state.coverage;
+  if (!list || !list.length) {
+    box.classList.add("hidden");
+    $("#coverage-chips").innerHTML = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  $("#coverage-chips").innerHTML = list.map((n) => {
+    const on = state.mustInclude.has(n.id);
+    return `<label class="cov-chip${on ? " on" : ""}" style="--dot:${GRAPH_COLORS[n.type] || "#9aa3af"}">` +
+      `<input type="checkbox" data-key="${esc(n.id)}"${on ? " checked" : ""}>` +
+      `<span class="legend-dot"></span>${esc(n.name)} ` +
+      `<span class="i">${n.chunk_count}</span></label>`;
+  }).join("");
+  $("#coverage-clear").classList.toggle("hidden", state.mustInclude.size === 0);
+  document.querySelectorAll("#coverage-chips input").forEach((el) => {
+    el.onchange = () => {
+      if (el.checked) state.mustInclude.add(el.dataset.key);
+      else state.mustInclude.delete(el.dataset.key);
+      renderCoverage();
+    };
+  });
+}
+
+$("#coverage-clear").onclick = () => {
+  state.mustInclude = new Set();
+  renderCoverage();
+};
 
 // ---------------------------------------------------------------------------
 // Versions
@@ -843,16 +897,21 @@ function playVideo(file, start, end) {
 // Knowledge graph explorer
 // ---------------------------------------------------------------------------
 const GRAPH_COLORS = {
-  thread: "#e8b350", place: "#7ab7ff", activity: "#7dd87d",
+  theme: "#ff9e64", thread: "#e8b350", place: "#7ab7ff", activity: "#7dd87d",
   person: "#e88ad0", object: "#9aa3af", mood: "#d6c37a",
 };
+const GRAPH_DETAIL_TYPES = ["object", "mood"];
 
 const graph = {
   data: null, nodes: [], edges: [], byId: {},
-  selected: null, search: "",
+  selected: null, search: "", showDetails: false,
   panX: 0, panY: 0, zoom: 1,
   animFrame: null, loading: false,
 };
+
+function graphVisible(n) {
+  return graph.showDetails || !GRAPH_DETAIL_TYPES.includes(n.type);
+}
 
 function resetGraph() {
   if (graph.animFrame) cancelAnimationFrame(graph.animFrame);
@@ -862,6 +921,7 @@ function resetGraph() {
   graph.byId = {};
   graph.selected = null;
   graph.search = "";
+  graph.showDetails = false;
   graph.panX = 0;
   graph.panY = 0;
   graph.zoom = 1;
@@ -869,6 +929,8 @@ function resetGraph() {
   graph.loading = false;
   const search = $("#graph-search");
   if (search) search.value = "";
+  const details = $("#graph-details");
+  if (details) details.checked = false;
   const panel = $("#graph-panel");
   if (panel) { panel.classList.add("hidden"); panel.innerHTML = ""; }
 }
@@ -988,6 +1050,7 @@ function drawGraph() {
 
   for (const e of graph.edges) {
     const a = graph.byId[e.a], b = graph.byId[e.b];
+    if (!graphVisible(a) || !graphVisible(b)) continue;
     const lit = graphMatches(a) && graphMatches(b);
     ctx.strokeStyle = lit ? "rgba(122, 183, 255, 0.25)" : "rgba(122, 183, 255, 0.06)";
     ctx.lineWidth = Math.min(4, 0.5 + e.weight * 0.5);
@@ -997,6 +1060,7 @@ function drawGraph() {
     ctx.stroke();
   }
   for (const n of graph.nodes) {
+    if (!graphVisible(n)) continue;
     const lit = graphMatches(n);
     ctx.globalAlpha = lit ? 1 : 0.18;
     ctx.fillStyle = GRAPH_COLORS[n.type] || "#9aa3af";
@@ -1027,6 +1091,7 @@ function graphNodeAt(clientX, clientY) {
   const y = (clientY - rect.top - graph.panY) / graph.zoom;
   for (let i = graph.nodes.length - 1; i >= 0; i--) {
     const n = graph.nodes[i];
+    if (!graphVisible(n)) continue;
     const dx = x - n.x, dy = y - n.y;
     if (dx * dx + dy * dy <= (n.r + 4) * (n.r + 4)) return n;
   }
@@ -1038,8 +1103,11 @@ function renderGraphLegend(data) {
   for (const n of data.nodes) counts[n.type] = (counts[n.type] || 0) + 1;
   $("#graph-legend").innerHTML = Object.entries(GRAPH_COLORS)
     .filter(([type]) => counts[type])
-    .map(([type, color]) =>
-      `<span class="legend-item"><span class="legend-dot" style="background:${color}"></span>${type} (${counts[type]})</span>`)
+    .map(([type, color]) => {
+      const hidden = !graph.showDetails && GRAPH_DETAIL_TYPES.includes(type);
+      return `<span class="legend-item${hidden ? " legend-hidden" : ""}">` +
+        `<span class="legend-dot" style="background:${color}"></span>${type} (${counts[type]}${hidden ? ", hidden" : ""})</span>`;
+    })
     .join("");
 }
 
@@ -1087,8 +1155,15 @@ function renderGraphPanel(node) {
 }
 
 function selectGraphNode(id) {
+  const node = graph.byId[id] || null;
+  if (node && !graphVisible(node)) {
+    graph.showDetails = true;
+    const details = $("#graph-details");
+    if (details) details.checked = true;
+    if (graph.data) renderGraphLegend(graph.data);
+  }
   graph.selected = id;
-  renderGraphPanel(graph.byId[id] || null);
+  renderGraphPanel(node);
   drawGraph();
 }
 
@@ -1133,6 +1208,18 @@ function wireGraphCanvas() {
     graph.search = e.target.value.trim().toLowerCase();
     drawGraph();
   };
+  $("#graph-details").onchange = (e) => {
+    graph.showDetails = e.target.checked;
+    if (!graph.showDetails && graph.selected) {
+      const sel = graph.byId[graph.selected];
+      if (sel && !graphVisible(sel)) {
+        graph.selected = null;
+        renderGraphPanel(null);
+      }
+    }
+    if (graph.data) renderGraphLegend(graph.data);
+    drawGraph();
+  };
 }
 wireGraphCanvas();
 
@@ -1160,6 +1247,7 @@ $("#btn-compose").onclick = () => {
     target_len: minutes > 0 ? minutes * 60 : null,
     margin: parseFloat($("#margin").value) || 3,
     sources: [...state.selectedSources],
+    must_include: [...state.mustInclude],
   });
 };
 $("#btn-edl-save").onclick = saveEdl;

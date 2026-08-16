@@ -47,6 +47,14 @@
           <label>Margin (s) <input id="margin" type="number" value="3" min="2" max="5" step="0.5"></label>
         </div>
         <p class="hint">Leave length blank to let the knowledge graph decide how many cuts cover the day.</p>
+        <div id="compose-coverage" class="hidden">
+          <div class="row">
+            <strong>Cover these</strong>
+            <span class="hint">ticked items are guaranteed a story beat in the edit</span>
+            <button id="coverage-clear" class="linkish hidden">clear</button>
+          </div>
+          <div id="coverage-chips"></div>
+        </div>
         <div id="selected-chips"></div>
         <button id="btn-compose">Compose + preview</button>
       </section>
@@ -54,6 +62,7 @@
       <section id="tab-graph" class="tab">
         <div id="graph-toolbar">
           <input id="graph-search" type="text" placeholder="Search entities...">
+          <label class="inline"><input id="graph-details" type="checkbox"> show details (objects, moods)</label>
           <span id="graph-legend"></span>
           <span id="graph-empty" class="hint hidden">No knowledge graph yet - run Analyze to build one.</span>
         </div>

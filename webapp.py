@@ -242,6 +242,7 @@ def job_compose(job):
     target_cuts = params.get("target_cuts")
     target_cuts = int(target_cuts) if target_cuts else None
     margin = max(2.0, min(5.0, float(params.get("margin") or 3.0)))
+    must_include = [str(k) for k in params.get("must_include") or []]
 
     engine.load_model()
     set_stage(job, f"composing story from {len(library.chunks)} chunks")
@@ -253,7 +254,8 @@ def job_compose(job):
         graph = engine.KnowledgeGraph.build(kg_store, library)
         if graph.entities:
             selections = composer.compose_with_graph(
-                library, story, graph, target_len=target_len, margin=margin)
+                library, story, graph, target_len=target_len, margin=margin,
+                must_include=must_include)
             if not selections:
                 print("Graph composition unusable - trying the legacy composer.")
         else:
@@ -275,7 +277,7 @@ def job_compose(job):
 
     version = add_version(project, "compose", {
         "parent": None, "brief": brief, "target_cuts": target_cuts,
-        "target_len": target_len,
+        "target_len": target_len, "must_include": must_include,
         "margin": margin, "sources": sources, "cut_count": len(edit_plan)})
     engine.FinalEditor.write_edl(edit_plan, edl_path(project, version))
 

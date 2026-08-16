@@ -82,6 +82,25 @@ label { display: block; margin: 8px 0; }
 #brief { width: 100%; max-width: 640px; }
 .chip { background: #2b3038; border-radius: 10px; padding: 2px 9px; font-size: 12px; }
 #selected-chips { margin: 10px 0; }
+#compose-coverage { margin: 12px 0; max-width: 640px; }
+#coverage-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.cov-chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin: 0;
+  padding: 3px 10px;
+  border: 1px solid #3c4350;
+  border-radius: 12px;
+  background: #1c2027;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cov-chip:hover { background: #232936; }
+.cov-chip.on { border-color: #7dd87d; background: #1e3a24; }
+.cov-chip input { display: none; }
+.cov-chip .legend-dot { background: var(--dot); }
+.cov-chip .i { color: #9aa3af; }
 #btn-compose { margin-top: 6px; padding: 8px 18px; }
 
 table { border-collapse: collapse; width: 100%; }
@@ -193,6 +212,7 @@ label.inline { display: inline-flex; gap: 6px; align-items: center; margin: 0; f
 #graph-search { width: 260px; }
 #graph-legend { display: flex; gap: 12px; font-size: 12px; color: #9aa3af; }
 .legend-item { display: inline-flex; gap: 5px; align-items: center; }
+.legend-item.legend-hidden { opacity: 0.45; }
 .legend-dot {
   width: 10px; height: 10px;
   border-radius: 50%;

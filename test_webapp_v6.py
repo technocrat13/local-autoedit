@@ -475,18 +475,25 @@ check("graph endpoint returns nodes with chunk refs",
 # graph-driven compose: no target_cuts in params -> compose_with_graph runs
 CWG = {}
 def fake_cwg(self, library, story, graph, target_len=None, margin=3.0,
-             max_total=None):
+             max_total=None, must_include=None):
     CWG["target_len"] = target_len
     CWG["max_total"] = max_total
+    CWG["must_include"] = must_include
     CWG["graph_ids"] = sorted(
         i for n in graph.entities.values() for i in n["chunk_ids"])
     return [{"chunk": library.chunks[0], "role": "setting",
              "reason": "graph pick", "beat": "street"}]
 ae.StoryComposer.compose_with_graph = fake_cwg
 j = run_job({"type": "compose", "project": projectB,
-             "params": {"brief": "graph day", "target_len": 300}})
+             "params": {"brief": "graph day", "target_len": 300,
+                        "must_include": ["place:street"]}})
 check("compose without cuts uses the graph", j["status"] == "done"
       and CWG.get("target_len") == 300.0)
+check("ticked coverage entities reach the composer",
+      CWG.get("must_include") == ["place:street"])
+vmeta = webapp.load_state(projectB)["versions"][-1]
+check("must_include recorded in version metadata",
+      vmeta.get("must_include") == ["place:street"])
 check("compose params summarized as target length",
       webapp.summarize_params("compose", {"brief": "graph day",
                                           "target_len": 300}).endswith("~5m"))
