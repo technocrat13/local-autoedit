@@ -519,6 +519,21 @@ check("suggest explores the graph inside the window", j["status"] == "done"
 check("graph suggest picks returned",
       j["result"]["picks"][0]["reason"] == "graph pick")
 
+# briefless suggest with ticked coverage entities: brief synthesized from them
+CWG.clear()
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "", "candidate_ids": window_ids,
+                        "must_include": ["place:street"]}})
+check("briefless suggest works when coverage ticked", j["status"] == "done"
+      and CWG.get("must_include") == ["place:street"])
+check("coverage-only suggest synthesizes a brief",
+      webapp.summarize_params(
+          "suggest", {"brief": "", "must_include": ["place:street"]})
+      == "brief: cover: street")
+j = run_job({"type": "suggest", "project": projectB,
+             "params": {"brief": "", "candidate_ids": window_ids}})
+check("suggest still demands brief or coverage", j["status"] == "error")
+
 # graph compose strikes out -> legacy composer takes over
 ae.StoryComposer.compose_with_graph = lambda self, library, story, graph, **k: []
 SEEN.clear()

@@ -383,7 +383,8 @@ function renderSectionHint() {
 
 function openSectionPicker() {
   state.picker = { mode: "section", gap: null, showAll: false, checked: new Set(),
-                   reasons: {}, roles: {}, aiStatus: "", query: "" };
+                   reasons: {}, roles: {}, aiStatus: "", query: "",
+                   mustInclude: new Set() };
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -434,10 +435,19 @@ function pickerCandidates(gap, showAll) {
 
 function openPicker(gap) {
   state.picker = { mode: "insert", gap, showAll: false, checked: new Set(),
-                   reasons: {}, roles: {}, aiStatus: "", query: "" };
+                   reasons: {}, roles: {}, aiStatus: "", query: "",
+                   mustInclude: new Set() };
   if (state.section) state.section = null;
   renderEdl();
   $("#edl-picker").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// coverage entities that have at least one chunk inside the picker's window
+function pickerCoverage(candidates) {
+  if (!state.coverage) return [];
+  const ids = new Set(candidates.map((c) => c.library_id));
+  return state.coverage.filter((n) =>
+    n.chunks && n.chunks.some((c) => ids.has(c.library_id)));
 }
 
 function renderPicker() {
@@ -468,6 +478,10 @@ function renderPicker() {
   const placeholder = isSection
     ? "brief for this section, e.g. 'the walk to the lighthouse, keep it moody'"
     : "brief for this gap, e.g. 'the coffee stop, keep it light'";
+  const coverage = pickerCoverage(candidates);
+  for (const key of [...p.mustInclude]) {  // window may have shrunk
+    if (!coverage.some((n) => n.id === key)) p.mustInclude.delete(key);
+  }
 
   box.innerHTML =
     `<div class="picker-head"><strong>${heading}</strong>` +
@@ -479,6 +493,16 @@ function renderPicker() {
     `${state.busy ? ' title="another job is running"' : ""}>` +
     `${isSection ? "Recreate story" : "Compose gap fill"}</button>` +
     `<span id="picker-ai-status" class="hint">${esc(p.aiStatus)}</span></div>` +
+    (coverage.length
+      ? `<div class="picker-coverage">` +
+        `<span class="hint">cover here:</span> ` +
+        coverage.map((n) => {
+          const on = p.mustInclude.has(n.id);
+          return `<label class="cov-chip${on ? " on" : ""}" style="--dot:${GRAPH_COLORS[n.type] || "#9aa3af"}">` +
+            `<input type="checkbox" data-key="${esc(n.id)}"${on ? " checked" : ""}>` +
+            `<span class="legend-dot"></span>${esc(n.name)}</label>`;
+        }).join(" ") + `</div>`
+      : "") +
     (candidates.length
       ? `<div class="picker-grid">` + candidates.map((c) => {
           const checked = p.checked.has(c.library_id);
@@ -523,6 +547,13 @@ function renderPicker() {
     $("#picker-showall").onchange = (e) => { p.showAll = e.target.checked; renderPicker(); };
   }
   $("#picker-query").oninput = (e) => { p.query = e.target.value; };
+  box.querySelectorAll(".picker-coverage input").forEach((el) => {
+    el.onchange = () => {
+      if (el.checked) p.mustInclude.add(el.dataset.key);
+      else p.mustInclude.delete(el.dataset.key);
+      renderPicker();
+    };
+  });
   $("#picker-suggest").onclick = () => runSuggest(candidates);
   $("#picker-add").onclick = () => addPicked(candidates);
   box.querySelectorAll(".pick-card").forEach((card) => {
@@ -544,9 +575,9 @@ function renderPicker() {
 async function runSuggest(candidates) {
   const p = state.picker;
   const brief = p.query.trim();
-  if (!brief) return alert(p.mode === "section"
-    ? "Give a brief for this section first."
-    : "Give a brief for this gap first.");
+  if (!brief && !p.mustInclude.size) return alert(p.mode === "section"
+    ? "Give a brief for this section or tick something to cover."
+    : "Give a brief for this gap or tick something to cover.");
   p.query = brief;
   p.aiStatus = "submitting…";
   renderPicker();
@@ -563,6 +594,7 @@ async function runSuggest(candidates) {
         params: {
           brief,
           candidate_ids: candidates.map((c) => c.library_id),
+          must_include: [...p.mustInclude],
         },
       }),
     });
@@ -578,9 +610,10 @@ async function runSuggest(candidates) {
           p.aiStatus = "failed: " + j.error;
         } else {
           const picks = (j.result && j.result.picks) || [];
+          const what = p.query || "the ticked coverage";
           p.aiStatus = picks.length
-            ? `composed ${picks.length} cut(s) for "${p.query}" - review below`
-            : `nothing matched "${p.query}"`;
+            ? `composed ${picks.length} cut(s) for "${what}" - review below`
+            : `nothing matched "${what}"`;
           for (const pick of picks) {
             p.checked.add(pick.library_id);
             p.reasons[pick.library_id] = pick.reason;

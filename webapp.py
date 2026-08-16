@@ -314,8 +314,12 @@ def job_suggest(job):
     if not chunks:
         raise RuntimeError("No analyzed chunks in this window to pick from.")
     brief = (params.get("brief") or "").strip()
+    must_include = [str(k) for k in params.get("must_include") or []]
     if not brief:
-        raise RuntimeError("Describe what should fill this gap.")
+        if not must_include:
+            raise RuntimeError("Describe what should fill this gap.")
+        # ticked coverage entities are a brief in themselves
+        brief = "cover: " + ", ".join(k.split(":", 1)[-1] for k in must_include)
     target_cuts = params.get("target_cuts")
     target_cuts = max(1, min(10, int(target_cuts))) if target_cuts else None
     view = LibraryView(chunks)
@@ -329,7 +333,8 @@ def job_suggest(job):
     subgraph = engine.KnowledgeGraph.build(kg_store, library).subgraph(candidate_ids)
     if subgraph.entities:
         selections = composer.compose_with_graph(
-            view, story, subgraph, max_total=target_cuts or 10)
+            view, story, subgraph, max_total=target_cuts or 10,
+            must_include=must_include)
     if not selections:
         if subgraph.entities:
             print("Graph gap fill unusable - trying the legacy composer.")
@@ -419,6 +424,11 @@ def summarize_params(job_type, params):
                 extra = f", {params['target_cuts']} cuts"
             else:
                 extra = ""
+            if not brief and params.get("must_include"):
+                brief = "cover: " + ", ".join(
+                    str(k).split(":", 1)[-1] for k in params["must_include"])
+                if len(brief) > 60:
+                    brief = brief[:57] + "..."
             return f"brief: {brief}{extra}" if brief else ""
         if job_type in ("preview", "finalize"):
             return f"version {params.get('version')}"

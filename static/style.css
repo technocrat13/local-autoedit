@@ -182,6 +182,13 @@ tr.sec-mid td { background: #241f16; }
 .picker-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .picker-ai { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
 .picker-ai input[type="text"] { flex: 1; min-width: 160px; }
+.picker-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 10px;
+}
 .picker-grid {
   display: grid;
   grid-template-columns: 1fr;
