@@ -46,10 +46,14 @@ ae.FFPROBE_BIN = "ffprobe"
 ae._NVENC_AVAILABLE = False  # deterministic libx264 args on this box
 
 _CURRENT = {}
+VIDEO_PARAMS = {}     # source path -> "w,h,num/den" for stream param probes
 def fake_run(cmd, **kwargs):
     ok = types.SimpleNamespace(returncode=0, stdout="", stderr="")
     if cmd[0] == "ffprobe":
-        ok.stdout = "10000.0\n"
+        if any("stream=width" in c for c in cmd):
+            ok.stdout = VIDEO_PARAMS.get(cmd[-1], "") + "\n"
+        else:
+            ok.stdout = "10000.0\n"
         return ok
     if "concat" in cmd:
         out = cmd[-1]
@@ -61,6 +65,7 @@ def fake_run(cmd, **kwargs):
     OPENED.append(src)
     _CURRENT["bitrate"] = cmd[cmd.index("-b:v") + 1]
     _CURRENT["preset"] = cmd[cmd.index("-preset") + 1]
+    _CURRENT["vf"] = cmd[cmd.index("-vf") + 1] if "-vf" in cmd else None
     with open(cmd[-1], "wb") as f:
         f.write(b"\x00")
     return ok
@@ -106,6 +111,22 @@ editor.render(plan, "final.mp4")
 check("final opens hi-res sources", OPENED == ["/fake/A.MP4", "/fake/B.MP4"])
 check("final uses 55Mbps at quality preset",
       RENDERS[-1]["bitrate"] == ae.FINAL_BITRATE and RENDERS[-1]["preset"] == "medium")
+check("uniform sources are not rescaled", RENDERS[-1]["vf"] is None)
+
+# ---- 2b. mixed resolution/aspect sources are normalized ----------------------
+check("probe_video_params parses stream line",
+      (VIDEO_PARAMS.setdefault("/fake/A.MP4", "3840,2160,30000/1001") or True)
+      and ae.VideoPreprocessor.probe_video_params("/fake/A.MP4") == (3840, 2160, 29.97))
+VIDEO_PARAMS["/fake/B.MP4"] = "1920,1080,30/1"
+mixed_plan = plan + [
+    {"source_file": "/fake/A.MP4", "lrf_file": "/fake/A.LRF", "start": 10.0, "end": 15.0}]
+OPENED.clear(); RENDERS.clear()
+editor.render(mixed_plan, "mixed.mp4")
+vf = RENDERS[-1]["vf"] or ""
+check("mixed sources get one normalized canvas",
+      "scale=3840:2160" in vf and "pad=3840:2160" in vf
+      and "setsar=1" in vf and "fps=29.97" in vf)
+VIDEO_PARAMS.clear()
 
 # ---- 3. render_from_edl on a hand-edited EDL ---------------------------------
 edl_path = os.path.join(tmp, "test_edl.json")

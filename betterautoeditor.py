@@ -1033,6 +1033,26 @@ class VideoPreprocessor:
             print(f"ffprobe could not read duration of {path}: {result.stderr.strip()}")
             return 0.0
 
+    @staticmethod
+    def probe_video_params(path):
+        """(width, height, fps) of the first video stream, or None."""
+        _, ffprobe = get_media_tools()
+        if not ffprobe:
+            return None
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=False,
+        )
+        try:
+            w, h, rate = result.stdout.strip().split(",")[:3]
+            num, den = (rate.split("/") + ["1"])[:2]
+            fps = float(num) / (float(den) or 1.0)
+            return int(w), int(h), round(fps, 2)
+        except (ValueError, ZeroDivisionError):
+            return None
+
     def extract_rolling_chunks(self, duration, chunk_duration=CHUNK_DURATION, max_chunks=None):
         num_chunks = int(np.ceil(duration / chunk_duration))
         chunks = []
@@ -1896,6 +1916,34 @@ class FinalEditor:
 
         t0 = time.time()
         durations = {}
+        # Mixed sources (different resolution/aspect/fps) break the lossless
+        # concat: players black-flash or skip where the stream parameters
+        # change. Normalize every segment to one canvas when sources differ.
+        params = {}
+        for cut in edit_plan:
+            src = cut.get(source_key)
+            if src and src not in params:
+                params[src] = VideoPreprocessor.probe_video_params(src)
+        known = [p for p in params.values() if p]
+        vf_args = []
+        if len(set(known)) > 1:
+            # majority resolution wins (ties -> larger canvas), majority fps
+            sizes = {}
+            fpss = {}
+            for cut in edit_plan:
+                p = params.get(cut.get(source_key))
+                if not p:
+                    continue
+                sizes[p[:2]] = sizes.get(p[:2], 0) + 1
+                fpss[p[2]] = fpss.get(p[2], 0) + 1
+            w, h = max(sizes, key=lambda s: (sizes[s], s[0] * s[1]))
+            fps = max(fpss, key=lambda f: (fpss[f], f))
+            print(f"Mixed source formats detected - normalizing segments to "
+                  f"{w}x{h} @ {fps:g}fps (pillar/letterboxing as needed).")
+            vf_args = ["-vf",
+                       f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                       f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g}"]
+
         segments = []
         for i, cut in enumerate(edit_plan):
             src = cut.get(source_key)
@@ -1913,7 +1961,7 @@ class FinalEditor:
             result = subprocess.run(
                 [ffmpeg, "-y", "-v", "error",
                  "-ss", f"{cut['start']:.3f}", "-t", f"{end - cut['start']:.3f}",
-                 "-i", src, *video_args, *audio_args,
+                 "-i", src, *vf_args, *video_args, *audio_args,
                  "-avoid_negative_ts", "make_zero", seg],
                 capture_output=True, text=True, check=False,
             )

@@ -461,8 +461,9 @@ check("added cut round-trips with exact bounds",
 # ---- 10b. knowledge graph endpoint + graph-driven compose/suggest -----------------
 ae.StoryComposer.compose_with_graph = real_cwg
 # section 9 replaced VideoPreprocessor with a bare lambda; compose's preview
-# render still calls the class-level probe_duration
+# render still calls the class-level probes
 ae.VideoPreprocessor.probe_duration = lambda src: 100.0
+ae.VideoPreprocessor.probe_video_params = lambda src: (1920, 1080, 30.0)
 
 data = client.post("/api/project/open", json={"path": projectB}).get_json()
 check("project open counts kg clips", data["library"]["kg_clips"] == 3)
